@@ -1,0 +1,54 @@
+# ========================
+# Target: ESP32-S3
+# ========================
+CONFIG_IDF_TARGET="esp32s3"
+
+# ========================
+# Flash
+# ========================
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ========================
+# Partition Table
+# ========================
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ========================
+# PSRAM (Octal, 8 MB)
+# ========================
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# ========================
+# CPU
+# ========================
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# ========================
+# FreeRTOS
+# ========================
+CONFIG_FREERTOS_HZ=1000
+
+# ========================
+# LVGL (via component manager)
+# ========================
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_WARN=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_USE_PERF_MONITOR=y
+
+# ========================
+# LCD RGB Panel
+# ========================
+CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
+
+# ========================
+# WiFi
+# ========================
+CONFIG_WIFI_MAX_RETRY=5
+# SSID and password are in secrets.defaults (gitignored)
