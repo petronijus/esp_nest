@@ -1,0 +1,13 @@
+# Build output
+build/
+
+# Generated sdkconfig (use sdkconfig.defaults for version control)
+sdkconfig
+sdkconfig.old
+
+# Secrets (WiFi credentials, API keys, etc.)
+secrets.defaults
+
+# Managed components (downloaded by ESP Component Manager)
+managed_components/
+dependencies.lock
