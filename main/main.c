@@ -6,6 +6,8 @@
 #include "lvgl.h"
 #include "screen.h"
 #include "wifi.h"
+#include "ha_mqtt.h"
+#include "ota_server.h"
 
 static const char *TAG = "main";
 
@@ -41,7 +43,6 @@ static void lvgl_task(void *arg)
     ESP_LOGI(TAG, "Initializing screen...");
     screen_init();
 
-    /* LVGL tick timer (2 ms period) */
     const esp_timer_create_args_t timer_args = {
         .callback = lvgl_tick_cb,
         .name = "lvgl_tick",
@@ -50,7 +51,6 @@ static void lvgl_task(void *arg)
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, 2000));
 
-    /* Create the UI */
     demo_ui();
 
     ESP_LOGI(TAG, "Entering LVGL main loop");
@@ -63,28 +63,65 @@ static void lvgl_task(void *arg)
     }
 }
 
+static void mqtt_telemetry_task(void *arg)
+{
+    for (;;) {
+        if (ha_mqtt_is_connected()) {
+            ha_mqtt_publish_state();
+        }
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "ZX2D10GE01R-V4848 starting...");
 
     /* Start LVGL on core 1 */
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8 * 1024, NULL, 5, NULL, 1);
-
-    /* Give LVGL a moment to init the display */
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    /* Initialize WiFi (runs on core 0) */
+    /* --- WiFi --- */
     ESP_LOGI(TAG, "Initializing WiFi...");
     update_status_label("Connecting\nWiFi...");
 
     esp_err_t wifi_ret = wifi_init_sta();
-    if (wifi_ret == ESP_OK) {
-        char buf[80];
-        snprintf(buf, sizeof(buf), "WiFi Connected!\nIP: %s", wifi_get_ip_str());
-        ESP_LOGI(TAG, "WiFi ready: %s", wifi_get_ip_str());
-        update_status_label(buf);
-    } else {
+    if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi connection failed");
         update_status_label("WiFi Failed!\nCheck config");
+        return;
     }
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "WiFi: %s\nIP: %s\nConnecting MQTT...",
+             CONFIG_WIFI_SSID, wifi_get_ip_str());
+    ESP_LOGI(TAG, "WiFi ready: %s", wifi_get_ip_str());
+    update_status_label(buf);
+
+    /* --- OTA Server --- */
+    ESP_LOGI(TAG, "Starting OTA server...");
+    ota_server_start();
+
+    /* --- MQTT --- */
+    ESP_LOGI(TAG, "Connecting MQTT...");
+    esp_err_t mqtt_ret = ha_mqtt_init();
+    if (mqtt_ret == ESP_OK) {
+        snprintf(buf, sizeof(buf), "IP: %s\nMQTT: Connected\nOTA: http://%s/",
+                 wifi_get_ip_str(), wifi_get_ip_str());
+        ESP_LOGI(TAG, "MQTT connected");
+        update_status_label(buf);
+
+        /* Publish initial state */
+        ha_mqtt_publish_state();
+    } else {
+        snprintf(buf, sizeof(buf), "IP: %s\nMQTT: Failed\nOTA: http://%s/",
+                 wifi_get_ip_str(), wifi_get_ip_str());
+        ESP_LOGW(TAG, "MQTT connection failed");
+        update_status_label(buf);
+    }
+
+    /* Periodic telemetry task */
+    xTaskCreate(mqtt_telemetry_task, "telemetry", 4096, NULL, 3, NULL);
+
+    ESP_LOGI(TAG, "All services started");
 }

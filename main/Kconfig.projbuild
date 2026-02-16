@@ -19,3 +19,25 @@ menu "WiFi Configuration"
             Number of retries before giving up on WiFi connection.
 
 endmenu
+
+menu "MQTT Configuration"
+
+    config MQTT_BROKER_URI
+        string "MQTT Broker URI"
+        default "mqtt://mqtt.home.arpa"
+        help
+            URI of the MQTT broker (e.g. mqtt://host:1883).
+
+    config MQTT_USERNAME
+        string "MQTT Username"
+        default ""
+        help
+            Username for MQTT broker authentication.
+
+    config MQTT_PASSWORD
+        string "MQTT Password"
+        default ""
+        help
+            Password for MQTT broker authentication.
+
+endmenu

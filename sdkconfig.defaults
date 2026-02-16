@@ -52,3 +52,14 @@ CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
 # ========================
 CONFIG_WIFI_MAX_RETRY=5
 # SSID and password are in secrets.defaults (gitignored)
+
+# ========================
+# MQTT
+# ========================
+CONFIG_MQTT_BROKER_URI="mqtt://mqtt.home.arpa"
+# Username and password are in secrets.defaults (gitignored)
+
+# ========================
+# HTTP Server (for OTA)
+# ========================
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
