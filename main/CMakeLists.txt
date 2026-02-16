@@ -4,4 +4,5 @@ idf_component_register(
     REQUIRES esp_lcd driver esp_timer esp_wifi esp_event esp_netif nvs_flash
              mqtt esp_http_server app_update
              button mt8901
+    EMBED_FILES "assets/lights.png" "assets/fiiuuu.png"
 )

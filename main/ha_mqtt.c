@@ -38,7 +38,7 @@ static void publish_ha_discovery(void)
     const char *dev_block =
         "\"dev\":{"
             "\"ids\":[\"%s\"],"
-            "\"name\":\"ESP Nest\","
+            "\"name\":\"Nest Hub\","
             "\"mf\":\"Panlee\","
             "\"mdl\":\"ZX2D10GE01R-V4848\","
             "\"sw\":\"%s\""

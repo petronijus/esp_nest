@@ -15,6 +15,7 @@
 #include "board.h"
 #include "button.h"
 #include "mt8901.h"
+#include "ui.h"
 
 static const char *TAG = "screen";
 
@@ -25,8 +26,22 @@ static esp_lcd_panel_handle_t g_panel_handle = NULL;
 static button_t *g_btn = NULL;
 
 /* ========================================================================== */
-/*  LVGL display flush callback                                               */
+/*  LVGL display flush callback with VSYNC sync                               */
 /* ========================================================================== */
+
+static SemaphoreHandle_t s_vsync_sem = NULL;
+static lv_display_t *s_disp = NULL;
+
+static bool IRAM_ATTR vsync_callback(esp_lcd_panel_handle_t panel,
+                                      const esp_lcd_rgb_panel_event_data_t *edata,
+                                      void *user_ctx)
+{
+    BaseType_t high_task_wakeup = pdFALSE;
+    if (s_vsync_sem) {
+        xSemaphoreGiveFromISR(s_vsync_sem, &high_task_wakeup);
+    }
+    return (high_task_wakeup == pdTRUE);
+}
 
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
@@ -34,6 +49,9 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     int y1 = area->y1;
     int x2 = area->x2;
     int y2 = area->y2;
+
+    /* Wait for previous VSYNC before swapping buffers */
+    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
 
     esp_lcd_panel_draw_bitmap(g_panel_handle, x1, y1, x2 + 1, y2 + 1, px_map);
     lv_display_flush_ready(disp);
@@ -311,6 +329,8 @@ static void spi_init_display_controller(void)
 
 static void rgb_panel_init(void)
 {
+    s_vsync_sem = xSemaphoreCreateBinary();
+
     esp_lcd_rgb_panel_config_t panel_config = {
         .data_width = 16,
         .psram_trans_align = 64,
@@ -340,13 +360,20 @@ static void rgb_panel_init(void)
         .flags.fb_in_psram = 1,
         .flags.double_fb = 1,
         .flags.refresh_on_demand = 0,
-        .bounce_buffer_size_px = 0,
+        .bounce_buffer_size_px = 10 * LCD_H_RES,
     };
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &g_panel_handle));
+
+    /* Register VSYNC callback for frame synchronization */
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        .on_vsync = vsync_callback,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(g_panel_handle, &cbs, NULL));
+
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel_handle));
-    ESP_LOGI(TAG, "RGB panel initialized (%dx%d)", LCD_H_RES, LCD_V_RES);
+    ESP_LOGI(TAG, "RGB panel initialized (%dx%d) with bounce buffer", LCD_H_RES, LCD_V_RES);
 
     /* Get the double frame buffers allocated in PSRAM */
     void *buf1 = NULL;
@@ -357,9 +384,9 @@ static void rgb_panel_init(void)
     lv_init();
 
     /* Create LVGL display with full-frame double buffering */
-    lv_display_t *disp = lv_display_create(LCD_H_RES, LCD_V_RES);
-    lv_display_set_flush_cb(disp, lvgl_flush_cb);
-    lv_display_set_buffers(disp, buf1, buf2,
+    s_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
+    lv_display_set_flush_cb(s_disp, lvgl_flush_cb);
+    lv_display_set_buffers(s_disp, buf1, buf2,
                            LCD_H_RES * LCD_V_RES * sizeof(lv_color_t),
                            LV_DISPLAY_RENDER_MODE_DIRECT);
 
@@ -373,10 +400,26 @@ static void rgb_panel_init(void)
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     static int last_count = 0;
+    static int accum = 0;
+
     int now = mt8901_get_count();
     int diff = now - last_count;
-    data->enc_diff = (diff != 0) ? ((diff > 0) ? -1 : 1) : 0;
     last_count = now;
+
+    data->enc_diff = 0;
+
+    if (diff != 0) {
+        accum += diff;
+
+        /* Require 3 accumulated encoder ticks to trigger a screen switch */
+        if (accum >= 3) {
+            ui_encoder_navigate(1);
+            accum = 0;
+        } else if (accum <= -3) {
+            ui_encoder_navigate(-1);
+            accum = 0;
+        }
+    }
 
     if (button_is_pressed(g_btn)) {
         data->state = LV_INDEV_STATE_PRESSED;
