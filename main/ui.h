@@ -18,3 +18,8 @@ void ui_set_status(const char *text);
  *        diff > 0: next screen, diff < 0: previous screen.
  */
 void ui_encoder_navigate(int diff);
+
+/**
+ * @brief Return the index of the currently active page (0 = Lights, 1 = Fan).
+ */
+int ui_get_current_page(void);

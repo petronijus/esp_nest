@@ -9,6 +9,7 @@
 #include "wifi.h"
 #include "ha_mqtt.h"
 #include "ota_server.h"
+#include "led_ring.h"
 
 static const char *TAG = "main";
 
@@ -97,6 +98,9 @@ void app_main(void)
     }
     ui_set_status(buf);
     ha_mqtt_publish_state();
+
+    /* LED ring breathing animation */
+    led_ring_start();
 
     /* Periodic telemetry */
     xTaskCreate(mqtt_telemetry_task, "telemetry", 4096, NULL, 3, NULL);

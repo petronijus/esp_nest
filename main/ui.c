@@ -17,14 +17,16 @@ static const char *TAG = "ui";
 #define COL_CIRCLE      lv_color_hex(0x888888)
 #define COL_WHITE       lv_color_hex(0xFFFFFF)
 
-/* Embedded PNG assets (linked via CMake EMBED_FILES) */
-extern const uint8_t lights_png_start[] asm("_binary_lights_png_start");
-extern const uint8_t lights_png_end[]   asm("_binary_lights_png_end");
-extern const uint8_t fiiuuu_png_start[] asm("_binary_fiiuuu_png_start");
-extern const uint8_t fiiuuu_png_end[]   asm("_binary_fiiuuu_png_end");
+/* ========================================================================== */
+/*  LVGL C-array image descriptors (defined in assets)                        */
+/* ========================================================================== */
 
-static lv_image_dsc_t img_lights_dsc;
-static lv_image_dsc_t img_fiiuuu_dsc;
+extern const lv_image_dsc_t bg_glow_yellow;
+extern const lv_image_dsc_t bg_glow_teal;
+extern const lv_image_dsc_t circle_glow_yellow;
+extern const lv_image_dsc_t circle_glow_teal;
+extern const lv_image_dsc_t lights;
+extern const lv_image_dsc_t fiiuuu;
 
 /* Single screen with two page containers */
 static lv_obj_t *s_screen = NULL;
@@ -34,24 +36,18 @@ static bool s_animating = false;
 static lv_obj_t *s_status_label = NULL;
 
 /* ========================================================================== */
-/*  PNG image descriptor setup                                                */
+/*  Image helpers                                                             */
 /* ========================================================================== */
 
-static void init_image_descriptors(void)
+static lv_obj_t *create_image(lv_obj_t *parent, const lv_image_dsc_t *dsc,
+                               lv_align_t align, int x_ofs, int y_ofs)
 {
-    /* Leave header.magic = 0 so the bin_decoder skips these,
-       allowing lodepng to handle them via the PNG magic in data */
-    memset(&img_lights_dsc, 0, sizeof(img_lights_dsc));
-    img_lights_dsc.data_size = lights_png_end - lights_png_start;
-    img_lights_dsc.data      = lights_png_start;
-
-    memset(&img_fiiuuu_dsc, 0, sizeof(img_fiiuuu_dsc));
-    img_fiiuuu_dsc.data_size = fiiuuu_png_end - fiiuuu_png_start;
-    img_fiiuuu_dsc.data      = fiiuuu_png_start;
-
-    ESP_LOGI(TAG, "PNG lights: %u bytes, fiiuuu: %u bytes",
-             (unsigned)img_lights_dsc.data_size,
-             (unsigned)img_fiiuuu_dsc.data_size);
+    lv_obj_t *img = lv_image_create(parent);
+    lv_image_set_src(img, dsc);
+    lv_obj_align(img, align, x_ofs, y_ofs);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(img, LV_OBJ_FLAG_FLOATING);
+    return img;
 }
 
 /* ========================================================================== */
@@ -115,12 +111,16 @@ static lv_obj_t *create_dot(lv_obj_t *parent, bool filled, lv_color_t color,
     return dot;
 }
 
-static lv_obj_t *create_title_image(lv_obj_t *parent, const lv_image_dsc_t *src)
+static lv_obj_t *create_title(lv_obj_t *parent, const char *fallback_text,
+                               const lv_image_dsc_t *img_dsc)
 {
     lv_obj_t *img = lv_image_create(parent);
-    lv_image_set_src(img, src);
+    lv_image_set_src(img, img_dsc);
     lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    ESP_LOGI(TAG, "Title image '%s': %ldx%ld", fallback_text,
+             (long)img_dsc->header.w, (long)img_dsc->header.h);
     return img;
 }
 
@@ -132,10 +132,17 @@ static lv_obj_t *build_lights_page(lv_obj_t *parent)
 {
     lv_obj_t *page = create_page_container(parent);
 
+    /* Background glow -- yellow at top */
+    create_image(page, &bg_glow_yellow, LV_ALIGN_TOP_MID, 0, 0);
+
     create_circle_outline(page);
+
+    /* Circle glow behind the outline */
+    create_image(page, &circle_glow_yellow, LV_ALIGN_CENTER, 0, 0);
+
     create_dot(page, true, COL_YELLOW, LV_ALIGN_TOP_MID, 77);
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_BOTTOM_MID, -77);
-    create_title_image(page, &img_lights_dsc);
+    create_title(page, "Lights", &lights);
 
     return page;
 }
@@ -144,16 +151,23 @@ static lv_obj_t *build_fan_page(lv_obj_t *parent)
 {
     lv_obj_t *page = create_page_container(parent);
 
+    /* Background glow -- teal at bottom */
+    create_image(page, &bg_glow_teal, LV_ALIGN_BOTTOM_MID, 0, 0);
+
     create_circle_outline(page);
+
+    /* Circle glow behind the outline */
+    create_image(page, &circle_glow_teal, LV_ALIGN_CENTER, 0, 0);
+
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_TOP_MID, 77);
     create_dot(page, true, COL_TEAL, LV_ALIGN_BOTTOM_MID, -77);
-    create_title_image(page, &img_fiiuuu_dsc);
+    create_title(page, "Fiiuuu", &fiiuuu);
 
     return page;
 }
 
 /* ========================================================================== */
-/*  Fade transition (opacity animation on page containers – no screen swap)   */
+/*  Fade transition (opacity animation on page containers -- no screen swap)  */
 /* ========================================================================== */
 
 static void fade_opa_cb(void *obj, int32_t value)
@@ -209,9 +223,12 @@ static void switch_page(int new_idx)
 
 void ui_init(void)
 {
-    init_image_descriptors();
+    ESP_LOGI(TAG, "Images: lights=%ldx%ld bg_yellow=%ldx%ld bg_teal=%ldx%ld",
+             (long)lights.header.w, (long)lights.header.h,
+             (long)bg_glow_yellow.header.w, (long)bg_glow_yellow.header.h,
+             (long)bg_glow_teal.header.w, (long)bg_glow_teal.header.h);
 
-    /* Single screen – never switched */
+    /* Single screen -- never switched */
     s_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(s_screen, COL_BLACK, 0);
     lv_obj_set_style_bg_opa(s_screen, LV_OPA_COVER, 0);
@@ -256,4 +273,9 @@ void ui_encoder_navigate(int diff)
     if (diff == 0) return;
     int next = s_current + (diff > 0 ? 1 : -1);
     switch_page(next);
+}
+
+int ui_get_current_page(void)
+{
+    return s_current;
 }

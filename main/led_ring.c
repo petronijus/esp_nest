@@ -1,0 +1,80 @@
+#include "led_ring.h"
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "led_strip.h"
+#include "board.h"
+#include "ui.h"
+
+static const char *TAG = "led_ring";
+
+#define NUM_LEDS        13
+#define BREATH_PERIOD_MS 3000
+#define TICK_MS          20
+#define MIN_BRIGHTNESS   0.05f
+#define MAX_BRIGHTNESS   0.45f
+
+static led_strip_handle_t s_strip = NULL;
+
+static void led_ring_task(void *arg)
+{
+    uint32_t tick = 0;
+
+    for (;;) {
+        /* Smooth sine-wave breathing: oscillate between MIN and MAX brightness */
+        float phase = (float)(tick % BREATH_PERIOD_MS) / (float)BREATH_PERIOD_MS;
+        float breath = MIN_BRIGHTNESS +
+                        (MAX_BRIGHTNESS - MIN_BRIGHTNESS) *
+                        (0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI));
+
+        /* Pick color based on current UI page */
+        uint8_t r, g, b;
+        if (ui_get_current_page() == 0) {
+            /* Yellow: #FFE600 */
+            r = (uint8_t)(255.0f * breath);
+            g = (uint8_t)(230.0f * breath);
+            b = 0;
+        } else {
+            /* Teal: #00E5CC */
+            r = 0;
+            g = (uint8_t)(229.0f * breath);
+            b = (uint8_t)(204.0f * breath);
+        }
+
+        for (int i = 0; i < NUM_LEDS; i++) {
+            led_strip_set_pixel(s_strip, i, r, g, b);
+        }
+        led_strip_refresh(s_strip);
+
+        vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+        tick += TICK_MS;
+    }
+}
+
+void led_ring_start(void)
+{
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_PIN,
+        .max_leds = NUM_LEDS,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+    };
+
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+
+    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create LED strip: %s", esp_err_to_name(err));
+        return;
+    }
+
+    led_strip_clear(s_strip);
+    led_strip_refresh(s_strip);
+    ESP_LOGI(TAG, "LED ring initialized (%d LEDs on GPIO %d)", NUM_LEDS, LED_PIN);
+
+    xTaskCreate(led_ring_task, "led_ring", 2048, NULL, 3, NULL);
+}

@@ -401,6 +401,7 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     static int last_count = 0;
     static int accum = 0;
+    static uint32_t cooldown_until = 0;
 
     int now = mt8901_get_count();
     int diff = now - last_count;
@@ -408,16 +409,22 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 
     data->enc_diff = 0;
 
-    if (diff != 0) {
+    uint32_t now_ms = lv_tick_get();
+
+    if (now_ms < cooldown_until) {
+        /* During cooldown: consume ticks but don't act on them */
+        accum = 0;
+    } else if (diff != 0) {
         accum += diff;
 
-        /* Require 3 accumulated encoder ticks to trigger a screen switch */
         if (accum >= 3) {
             ui_encoder_navigate(1);
             accum = 0;
+            cooldown_until = now_ms + 600;
         } else if (accum <= -3) {
             ui_encoder_navigate(-1);
             accum = 0;
+            cooldown_until = now_ms + 600;
         }
     }
 
