@@ -73,18 +73,16 @@ static lv_obj_t *s_fan_hint = NULL;
 /*  Animated gradient arc (screen-level, rotates + changes color)             */
 /* ========================================================================== */
 
-#define GRADIENT_LAYERS 7
+#define GRADIENT_LAYERS 5
 
 static lv_obj_t *s_gradient_arcs[GRADIENT_LAYERS];
 
 static const struct { int half_span; lv_opa_t opa; } arc_layer_defs[GRADIENT_LAYERS] = {
-    {90,  13},              /* ~5% */
-    {75,  LV_OPA_10},
-    {60,  38},              /* ~15% */
-    {45,  64},              /* ~25% */
-    {30,  LV_OPA_40},
-    {18,  LV_OPA_60},
-    {8,   LV_OPA_80},
+    {90,  LV_OPA_10},
+    {65,  LV_OPA_20},
+    {42,  LV_OPA_40},
+    {22,  LV_OPA_60},
+    {8,   LV_OPA_90},
 };
 
 static int s_arc_from_deg;
@@ -133,11 +131,16 @@ static void init_gradient_arcs(lv_obj_t *parent)
 static void arc_rotate_anim_cb(void *var, int32_t progress)
 {
     int deg = s_arc_from_deg + s_arc_delta_deg * progress / 255;
-    uint8_t mix = (uint8_t)progress;
-    lv_color_t from_col = (s_arc_delta_deg > 0) ? COL_YELLOW : COL_TEAL;
-    lv_color_t to_col   = (s_arc_delta_deg > 0) ? COL_TEAL   : COL_YELLOW;
-    lv_color_t color = lv_color_mix(to_col, from_col, mix);
-    update_gradient_arcs(deg, color);
+    int center = ((deg % 360) + 360) % 360;
+
+    /* Color purely from position: 270°=yellow, 90°=teal */
+    int cw_dist = (center - 270 + 360) % 360;
+    uint8_t mix = (cw_dist <= 180)
+        ? (uint8_t)(cw_dist * 255 / 180)
+        : (uint8_t)((360 - cw_dist) * 255 / 180);
+
+    lv_color_t color = lv_color_mix(COL_TEAL, COL_YELLOW, mix);
+    update_gradient_arcs(center, color);
 }
 
 /* ========================================================================== */
@@ -496,7 +499,7 @@ static void switch_page(int new_idx, int dir)
 
     /* Rotate gradient arc: CW for forward, CCW for backward */
     s_arc_from_deg = (s_current == 0) ? 270 : 90;
-    s_arc_delta_deg = (dir > 0) ? 180 : -180;
+    s_arc_delta_deg = (dir > 0) ? -180 : 180;
 
     lv_anim_t arc_anim;
     lv_anim_init(&arc_anim);
