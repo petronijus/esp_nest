@@ -17,6 +17,11 @@ static const char *TAG = "ui";
 #define COL_CIRCLE      lv_color_hex(0x888888)
 #define COL_WHITE       lv_color_hex(0xFFFFFF)
 
+/* Brightness detail screen constants */
+#define BRIGHT_OUTER_DIAM   456
+#define BRIGHT_CIRCLE_MAX   420
+#define BRIGHT_CIRCLE_MIN   10
+
 /* ========================================================================== */
 /*  LVGL C-array image descriptors (defined in assets)                        */
 /* ========================================================================== */
@@ -28,12 +33,29 @@ extern const lv_image_dsc_t circle_glow_teal;
 extern const lv_image_dsc_t lights;
 extern const lv_image_dsc_t fiiuuu;
 
-/* Single screen with two page containers */
+/* ========================================================================== */
+/*  UI mode state                                                             */
+/* ========================================================================== */
+
+typedef enum {
+    UI_MODE_MENU,
+    UI_MODE_BRIGHTNESS,
+} ui_mode_t;
+
+static ui_mode_t s_mode = UI_MODE_MENU;
+static int s_brightness = 30;
+
+/* Single screen with page containers */
 static lv_obj_t *s_screen = NULL;
 static lv_obj_t *s_pages[SCREEN_COUNT];
 static int s_current = 0;
 static bool s_animating = false;
 static lv_obj_t *s_status_label = NULL;
+
+/* Brightness detail page widgets */
+static lv_obj_t *s_bright_page = NULL;
+static lv_obj_t *s_bright_circle = NULL;
+static lv_obj_t *s_bright_label = NULL;
 
 /* ========================================================================== */
 /*  Image helpers                                                             */
@@ -60,8 +82,9 @@ static lv_obj_t *create_page_container(lv_obj_t *parent)
     lv_obj_remove_style_all(page);
     lv_obj_set_size(page, 480, 480);
     lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, 0);
-    lv_obj_center(page);
+    lv_obj_set_pos(page, 0, 0);
     lv_obj_clear_flag(page, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_FLOATING);
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_pad_all(page, 0, 0);
     return page;
@@ -167,7 +190,85 @@ static lv_obj_t *build_fan_page(lv_obj_t *parent)
 }
 
 /* ========================================================================== */
-/*  Fade transition (opacity animation on page containers -- no screen swap)  */
+/*  Brightness detail page                                                    */
+/* ========================================================================== */
+
+static void update_brightness_display(void)
+{
+    if (!s_bright_label || !s_bright_circle) return;
+
+    /* Update number */
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", s_brightness);
+    lv_label_set_text(s_bright_label, buf);
+
+    /* Update yellow circle size: scale linearly from MIN to MAX */
+    if (s_brightness <= 0) {
+        lv_obj_add_flag(s_bright_circle, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        int diam = BRIGHT_CIRCLE_MIN +
+                   (BRIGHT_CIRCLE_MAX - BRIGHT_CIRCLE_MIN) * s_brightness / 100;
+        lv_obj_clear_flag(s_bright_circle, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(s_bright_circle, diam, diam);
+        /* Re-center after size change */
+        lv_obj_set_pos(s_bright_circle, (480 - diam) / 2, (480 - diam) / 2);
+    }
+}
+
+static lv_obj_t *build_brightness_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    /* Outer circle outline */
+    lv_obj_t *outer = lv_obj_create(page);
+    lv_obj_remove_style_all(outer);
+    lv_obj_set_size(outer, BRIGHT_OUTER_DIAM, BRIGHT_OUTER_DIAM);
+    lv_obj_set_style_radius(outer, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(outer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(outer, 1, 0);
+    lv_obj_set_style_border_color(outer, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_opa(outer, LV_OPA_COVER, 0);
+    lv_obj_align(outer, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(outer, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Yellow filled circle (dynamic size based on brightness) */
+    s_bright_circle = lv_obj_create(page);
+    lv_obj_remove_style_all(s_bright_circle);
+    lv_obj_set_style_radius(s_bright_circle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_bright_circle, COL_YELLOW, 0);
+    lv_obj_set_style_bg_opa(s_bright_circle, LV_OPA_COVER, 0);
+    lv_obj_align(s_bright_circle, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(s_bright_circle, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_bright_circle, LV_OBJ_FLAG_FLOATING);
+
+    /* Brightness number */
+    s_bright_label = lv_label_create(page);
+    lv_label_set_text(s_bright_label, "30");
+    lv_obj_set_style_text_color(s_bright_label, COL_WHITE, 0);
+    lv_obj_set_style_text_font(s_bright_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_align(s_bright_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_bright_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(s_bright_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_bright_label, LV_OBJ_FLAG_FLOATING);
+
+    /* Hint text */
+    lv_obj_t *hint = lv_label_create(page);
+    lv_label_set_text(hint, "long press to turn off");
+    lv_obj_set_style_text_color(hint, COL_WHITE, 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(hint, 3, 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 90);
+    lv_obj_clear_flag(hint, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Set initial display */
+    update_brightness_display();
+
+    return page;
+}
+
+/* ========================================================================== */
+/*  Fade transition (opacity animation on page containers)                    */
 /* ========================================================================== */
 
 static void fade_opa_cb(void *obj, int32_t value)
@@ -175,9 +276,50 @@ static void fade_opa_cb(void *obj, int32_t value)
     lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
 }
 
+static lv_obj_t *s_fade_out_target = NULL;
+
+static void fade_out_done_cb(lv_anim_t *a)
+{
+    if (s_fade_out_target) {
+        lv_obj_add_flag(s_fade_out_target, LV_OBJ_FLAG_HIDDEN);
+        s_fade_out_target = NULL;
+    }
+}
+
 static void fade_in_done_cb(lv_anim_t *a)
 {
     s_animating = false;
+}
+
+static void fade_transition(lv_obj_t *from, lv_obj_t *to)
+{
+    if (s_animating) return;
+    s_animating = true;
+
+    /* Fade out old page, then hide it */
+    s_fade_out_target = from;
+
+    lv_anim_t a_out;
+    lv_anim_init(&a_out);
+    lv_anim_set_var(&a_out, from);
+    lv_anim_set_values(&a_out, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_exec_cb(&a_out, fade_opa_cb);
+    lv_anim_set_duration(&a_out, FADE_TIME_MS);
+    lv_anim_set_completed_cb(&a_out, fade_out_done_cb);
+    lv_anim_start(&a_out);
+
+    /* Fade in new page */
+    lv_obj_set_style_opa(to, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(to, LV_OBJ_FLAG_HIDDEN);
+
+    lv_anim_t a_in;
+    lv_anim_init(&a_in);
+    lv_anim_set_var(&a_in, to);
+    lv_anim_set_values(&a_in, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_exec_cb(&a_in, fade_opa_cb);
+    lv_anim_set_duration(&a_in, FADE_TIME_MS);
+    lv_anim_set_completed_cb(&a_in, fade_in_done_cb);
+    lv_anim_start(&a_in);
 }
 
 static void switch_page(int new_idx)
@@ -187,34 +329,31 @@ static void switch_page(int new_idx)
     if (new_idx == s_current) return;
     if (s_animating) return;
 
-    s_animating = true;
-
-    lv_obj_t *old_page = s_pages[s_current];
-    lv_obj_t *new_page = s_pages[new_idx];
-
-    /* Fade out the old page */
-    lv_anim_t a_out;
-    lv_anim_init(&a_out);
-    lv_anim_set_var(&a_out, old_page);
-    lv_anim_set_values(&a_out, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_exec_cb(&a_out, fade_opa_cb);
-    lv_anim_set_duration(&a_out, FADE_TIME_MS);
-    lv_anim_start(&a_out);
-
-    /* Fade in the new page */
-    lv_obj_set_style_opa(new_page, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(new_page, LV_OBJ_FLAG_HIDDEN);
-
-    lv_anim_t a_in;
-    lv_anim_init(&a_in);
-    lv_anim_set_var(&a_in, new_page);
-    lv_anim_set_values(&a_in, LV_OPA_TRANSP, LV_OPA_COVER);
-    lv_anim_set_exec_cb(&a_in, fade_opa_cb);
-    lv_anim_set_duration(&a_in, FADE_TIME_MS);
-    lv_anim_set_completed_cb(&a_in, fade_in_done_cb);
-    lv_anim_start(&a_in);
-
+    fade_transition(s_pages[s_current], s_pages[new_idx]);
     s_current = new_idx;
+}
+
+/* ========================================================================== */
+/*  Mode transitions                                                          */
+/* ========================================================================== */
+
+static void enter_brightness_mode(void)
+{
+    if (s_mode != UI_MODE_MENU || s_animating) return;
+
+    s_mode = UI_MODE_BRIGHTNESS;
+    update_brightness_display();
+    fade_transition(s_pages[s_current], s_bright_page);
+    ESP_LOGI(TAG, "Entered brightness mode (brightness=%d)", s_brightness);
+}
+
+static void exit_brightness_mode(void)
+{
+    if (s_mode != UI_MODE_BRIGHTNESS || s_animating) return;
+
+    s_mode = UI_MODE_MENU;
+    fade_transition(s_bright_page, s_pages[s_current]);
+    ESP_LOGI(TAG, "Exited brightness mode (brightness=%d)", s_brightness);
 }
 
 /* ========================================================================== */
@@ -236,16 +375,21 @@ void ui_init(void)
     lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_screen, LV_SCROLLBAR_MODE_OFF);
 
-    /* Build both pages as children of the same screen */
+    /* Build menu pages */
     s_pages[0] = build_lights_page(s_screen);
     s_pages[1] = build_fan_page(s_screen);
+
+    /* Build brightness detail page (initially hidden) */
+    s_bright_page = build_brightness_page(s_screen);
+    lv_obj_set_style_opa(s_bright_page, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(s_bright_page, LV_OBJ_FLAG_HIDDEN);
 
     /* Start with page 0 visible, page 1 hidden */
     lv_obj_set_style_opa(s_pages[0], LV_OPA_COVER, 0);
     lv_obj_set_style_opa(s_pages[1], LV_OPA_TRANSP, 0);
     lv_obj_add_flag(s_pages[1], LV_OBJ_FLAG_HIDDEN);
 
-    /* Status label (on the screen itself, above both pages) */
+    /* Status label (on the screen itself, above everything) */
     s_status_label = lv_label_create(s_screen);
     lv_label_set_text(s_status_label, "");
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x555555), 0);
@@ -256,9 +400,10 @@ void ui_init(void)
 
     lv_screen_load(s_screen);
     s_current = 0;
+    s_mode = UI_MODE_MENU;
     s_animating = false;
 
-    ESP_LOGI(TAG, "UI initialized with %d pages (single screen)", SCREEN_COUNT);
+    ESP_LOGI(TAG, "UI initialized with %d pages + brightness detail", SCREEN_COUNT);
 }
 
 void ui_set_status(const char *text)
@@ -271,11 +416,52 @@ void ui_set_status(const char *text)
 void ui_encoder_navigate(int diff)
 {
     if (diff == 0) return;
-    int next = s_current + (diff > 0 ? 1 : -1);
-    switch_page(next);
+
+    if (s_mode == UI_MODE_BRIGHTNESS) {
+        /* Adjust brightness */
+        s_brightness += diff;
+        if (s_brightness < 0) s_brightness = 0;
+        if (s_brightness > 100) s_brightness = 100;
+        update_brightness_display();
+    } else {
+        /* Menu navigation */
+        int next = s_current + (diff > 0 ? 1 : -1);
+        switch_page(next);
+    }
+}
+
+void ui_encoder_press(void)
+{
+    if (s_mode == UI_MODE_MENU) {
+        if (s_current == 0) {
+            enter_brightness_mode();
+        }
+    } else if (s_mode == UI_MODE_BRIGHTNESS) {
+        exit_brightness_mode();
+    }
+}
+
+void ui_encoder_long_press(void)
+{
+    if (s_mode == UI_MODE_BRIGHTNESS) {
+        s_brightness = 0;
+        update_brightness_display();
+        ESP_LOGI(TAG, "Long press: brightness set to 0");
+        exit_brightness_mode();
+    }
 }
 
 int ui_get_current_page(void)
 {
     return s_current;
+}
+
+bool ui_is_detail_mode(void)
+{
+    return s_mode != UI_MODE_MENU;
+}
+
+int ui_get_brightness(void)
+{
+    return s_brightness;
 }

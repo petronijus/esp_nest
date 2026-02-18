@@ -402,6 +402,9 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     static int last_count = 0;
     static int accum = 0;
     static uint32_t cooldown_until = 0;
+    static bool was_pressed = false;
+    static uint32_t press_start = 0;
+    static bool long_press_fired = false;
 
     int now = mt8901_get_count();
     int diff = now - last_count;
@@ -410,34 +413,63 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     data->enc_diff = 0;
 
     uint32_t now_ms = lv_tick_get();
+    bool detail = ui_is_detail_mode();
 
+    /* --- Rotation handling --- */
     if (now_ms < cooldown_until) {
-        /* During cooldown: consume ticks but don't act on them */
         accum = 0;
     } else if (diff != 0) {
-        accum += diff;
-
-        if (accum >= 3) {
-            ui_encoder_navigate(1);
-            accum = 0;
-            cooldown_until = now_ms + 600;
-        } else if (accum <= -3) {
-            ui_encoder_navigate(-1);
-            accum = 0;
-            cooldown_until = now_ms + 600;
+        if (detail) {
+            /* In detail mode: each tick changes brightness by 1 */
+            ui_encoder_navigate(diff);
+        } else {
+            /* In menu mode: accumulate 3 ticks before switching */
+            accum += diff;
+            if (accum >= 3) {
+                ui_encoder_navigate(1);
+                accum = 0;
+                cooldown_until = now_ms + 600;
+            } else if (accum <= -3) {
+                ui_encoder_navigate(-1);
+                accum = 0;
+                cooldown_until = now_ms + 600;
+            }
         }
     }
 
-    if (button_is_pressed(g_btn)) {
-        data->state = LV_INDEV_STATE_PRESSED;
-    } else {
-        data->state = LV_INDEV_STATE_RELEASED;
+    /* --- Button press / long-press detection --- */
+    bool pressed = button_is_pressed(g_btn);
+
+    if (pressed && !was_pressed) {
+        press_start = now_ms;
+        long_press_fired = false;
     }
+
+    if (pressed && !long_press_fired) {
+        if ((now_ms - press_start) > 1000) {
+            ui_encoder_long_press();
+            long_press_fired = true;
+        }
+    }
+
+    if (!pressed && was_pressed) {
+        if (!long_press_fired && (now_ms - press_start) > 50) {
+            ui_encoder_press();
+        }
+        accum = 0;
+        cooldown_until = now_ms + 300;
+    }
+
+    was_pressed = pressed;
+    data->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
 static void encoder_init(void)
 {
-    g_btn = button_attach(BTN_PIN, 1, 10);
+    /* Reset GPIO 3 first to clear any strapping-pin configuration */
+    gpio_reset_pin(BTN_PIN);
+
+    g_btn = button_attach(BTN_PIN, 0, 10);
     mt8901_init(ENCODER_A_PIN, ENCODER_B_PIN);
 
     lv_indev_t *indev = lv_indev_create();
