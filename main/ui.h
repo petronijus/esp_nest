@@ -49,3 +49,8 @@ bool ui_is_detail_mode(void);
  * @brief Return the current brightness value (0-100).
  */
 int ui_get_brightness(void);
+
+/**
+ * @brief Return the current fan level (0=off, 1=low, 2=medium, 3=high).
+ */
+int ui_get_fan_level(void);

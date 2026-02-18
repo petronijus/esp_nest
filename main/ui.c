@@ -40,10 +40,15 @@ extern const lv_image_dsc_t fiiuuu;
 typedef enum {
     UI_MODE_MENU,
     UI_MODE_BRIGHTNESS,
+    UI_MODE_FAN,
 } ui_mode_t;
 
 static ui_mode_t s_mode = UI_MODE_MENU;
 static int s_brightness = 30;
+
+/* Fan detail state: 0=off, 1=low, 2=medium, 3=high */
+static int s_fan_level = 0;
+static int s_fan_accum = 0;
 
 /* Single screen with page containers */
 static lv_obj_t *s_screen = NULL;
@@ -56,6 +61,11 @@ static lv_obj_t *s_status_label = NULL;
 static lv_obj_t *s_bright_page = NULL;
 static lv_obj_t *s_bright_circle = NULL;
 static lv_obj_t *s_bright_label = NULL;
+
+/* Fan detail page widgets */
+static lv_obj_t *s_fan_page = NULL;
+static lv_obj_t *s_fan_circles[3];   /* [0]=outer(456), [1]=mid(281), [2]=small(126) */
+static lv_obj_t *s_fan_label = NULL;
 
 /* ========================================================================== */
 /*  Image helpers                                                             */
@@ -265,6 +275,82 @@ static lv_obj_t *build_brightness_page(lv_obj_t *parent)
 }
 
 /* ========================================================================== */
+/*  Fan detail page                                                           */
+/* ========================================================================== */
+
+#define FAN_OUTER_DIAM  456
+#define FAN_MID_DIAM    281
+#define FAN_SMALL_DIAM  126
+
+static const char *fan_level_names[] = {"off", "low", "medium", "high"};
+
+static void update_fan_display(void)
+{
+    if (!s_fan_label) return;
+
+    lv_label_set_text(s_fan_label, fan_level_names[s_fan_level]);
+
+    for (int i = 0; i < 3; i++) {
+        /* Circle index 0 = outer (fills at level 3),
+         * 1 = mid (fills at level >= 2), 2 = small (fills at level >= 1).
+         * So circle i is filled when s_fan_level >= (3 - i). */
+        bool filled = (s_fan_level >= (3 - i));
+
+        if (filled) {
+            lv_obj_set_style_bg_color(s_fan_circles[i], COL_TEAL, 0);
+            lv_obj_set_style_bg_opa(s_fan_circles[i], LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(s_fan_circles[i], 0, 0);
+        } else {
+            lv_obj_set_style_bg_opa(s_fan_circles[i], LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(s_fan_circles[i], 1, 0);
+            lv_obj_set_style_border_color(s_fan_circles[i], lv_color_hex(0x444444), 0);
+            lv_obj_set_style_border_opa(s_fan_circles[i], LV_OPA_COVER, 0);
+        }
+    }
+}
+
+static lv_obj_t *build_fan_detail_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    static const int diams[] = {FAN_OUTER_DIAM, FAN_MID_DIAM, FAN_SMALL_DIAM};
+
+    for (int i = 0; i < 3; i++) {
+        s_fan_circles[i] = lv_obj_create(page);
+        lv_obj_remove_style_all(s_fan_circles[i]);
+        lv_obj_set_size(s_fan_circles[i], diams[i], diams[i]);
+        lv_obj_set_style_radius(s_fan_circles[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(s_fan_circles[i], LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s_fan_circles[i], 1, 0);
+        lv_obj_set_style_border_color(s_fan_circles[i], lv_color_hex(0x444444), 0);
+        lv_obj_set_style_border_opa(s_fan_circles[i], LV_OPA_COVER, 0);
+        lv_obj_align(s_fan_circles[i], LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(s_fan_circles[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    s_fan_label = lv_label_create(page);
+    lv_label_set_text(s_fan_label, "off");
+    lv_obj_set_style_text_color(s_fan_label, COL_WHITE, 0);
+    lv_obj_set_style_text_font(s_fan_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_align(s_fan_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_fan_label, LV_ALIGN_CENTER, 0, 19);
+    lv_obj_clear_flag(s_fan_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hint = lv_label_create(page);
+    lv_label_set_text(hint, "long press to turn off");
+    lv_obj_set_style_text_color(hint, COL_WHITE, 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(hint, 3, 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 90);
+    lv_obj_clear_flag(hint, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    update_fan_display();
+
+    return page;
+}
+
+/* ========================================================================== */
 /*  Fade transition (opacity animation on page containers)                    */
 /* ========================================================================== */
 
@@ -353,6 +439,26 @@ static void exit_brightness_mode(void)
     ESP_LOGI(TAG, "Exited brightness mode (brightness=%d)", s_brightness);
 }
 
+static void enter_fan_mode(void)
+{
+    if (s_mode != UI_MODE_MENU || s_animating) return;
+
+    s_mode = UI_MODE_FAN;
+    s_fan_accum = 0;
+    update_fan_display();
+    fade_transition(s_pages[s_current], s_fan_page);
+    ESP_LOGI(TAG, "Entered fan mode (level=%d)", s_fan_level);
+}
+
+static void exit_fan_mode(void)
+{
+    if (s_mode != UI_MODE_FAN || s_animating) return;
+
+    s_mode = UI_MODE_MENU;
+    fade_transition(s_fan_page, s_pages[s_current]);
+    ESP_LOGI(TAG, "Exited fan mode (level=%d)", s_fan_level);
+}
+
 /* ========================================================================== */
 /*  Public API                                                                */
 /* ========================================================================== */
@@ -381,6 +487,11 @@ void ui_init(void)
     lv_obj_set_style_opa(s_bright_page, LV_OPA_TRANSP, 0);
     lv_obj_add_flag(s_bright_page, LV_OBJ_FLAG_HIDDEN);
 
+    /* Build fan detail page (initially hidden) */
+    s_fan_page = build_fan_detail_page(s_screen);
+    lv_obj_set_style_opa(s_fan_page, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(s_fan_page, LV_OBJ_FLAG_HIDDEN);
+
     /* Start with page 0 visible, page 1 hidden */
     lv_obj_set_style_opa(s_pages[0], LV_OPA_COVER, 0);
     lv_obj_set_style_opa(s_pages[1], LV_OPA_TRANSP, 0);
@@ -400,7 +511,7 @@ void ui_init(void)
     s_mode = UI_MODE_MENU;
     s_animating = false;
 
-    ESP_LOGI(TAG, "UI initialized with %d pages + brightness detail", SCREEN_COUNT);
+    ESP_LOGI(TAG, "UI initialized with %d pages + brightness/fan detail", SCREEN_COUNT);
 }
 
 void ui_set_status(const char *text)
@@ -415,13 +526,24 @@ void ui_encoder_navigate(int diff)
     if (diff == 0) return;
 
     if (s_mode == UI_MODE_BRIGHTNESS) {
-        /* Adjust brightness */
         s_brightness += diff;
         if (s_brightness < 0) s_brightness = 0;
         if (s_brightness > 100) s_brightness = 100;
         update_brightness_display();
+    } else if (s_mode == UI_MODE_FAN) {
+        s_fan_accum += diff;
+        if (s_fan_accum >= 3) {
+            s_fan_level++;
+            if (s_fan_level > 3) s_fan_level = 3;
+            s_fan_accum = 0;
+            update_fan_display();
+        } else if (s_fan_accum <= -3) {
+            s_fan_level--;
+            if (s_fan_level < 0) s_fan_level = 0;
+            s_fan_accum = 0;
+            update_fan_display();
+        }
     } else {
-        /* Menu navigation */
         int next = s_current + (diff > 0 ? 1 : -1);
         switch_page(next);
     }
@@ -432,9 +554,13 @@ void ui_encoder_press(void)
     if (s_mode == UI_MODE_MENU) {
         if (s_current == 0) {
             enter_brightness_mode();
+        } else if (s_current == 1) {
+            enter_fan_mode();
         }
     } else if (s_mode == UI_MODE_BRIGHTNESS) {
         exit_brightness_mode();
+    } else if (s_mode == UI_MODE_FAN) {
+        exit_fan_mode();
     }
 }
 
@@ -445,6 +571,11 @@ void ui_encoder_long_press(void)
         update_brightness_display();
         ESP_LOGI(TAG, "Long press: brightness set to 0");
         exit_brightness_mode();
+    } else if (s_mode == UI_MODE_FAN) {
+        s_fan_level = 0;
+        update_fan_display();
+        ESP_LOGI(TAG, "Long press: fan set to off");
+        exit_fan_mode();
     }
 }
 
@@ -461,4 +592,9 @@ bool ui_is_detail_mode(void)
 int ui_get_brightness(void)
 {
     return s_brightness;
+}
+
+int ui_get_fan_level(void)
+{
+    return s_fan_level;
 }
