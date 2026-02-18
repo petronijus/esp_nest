@@ -210,8 +210,7 @@ static void update_brightness_display(void)
                    (BRIGHT_CIRCLE_MAX - BRIGHT_CIRCLE_MIN) * s_brightness / 100;
         lv_obj_clear_flag(s_bright_circle, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_size(s_bright_circle, diam, diam);
-        /* Re-center after size change */
-        lv_obj_set_pos(s_bright_circle, (480 - diam) / 2, (480 - diam) / 2);
+        lv_obj_center(s_bright_circle);
     }
 }
 
@@ -239,7 +238,6 @@ static lv_obj_t *build_brightness_page(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(s_bright_circle, LV_OPA_COVER, 0);
     lv_obj_align(s_bright_circle, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(s_bright_circle, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_bright_circle, LV_OBJ_FLAG_FLOATING);
 
     /* Brightness number */
     s_bright_label = lv_label_create(page);
@@ -249,7 +247,6 @@ static lv_obj_t *build_brightness_page(lv_obj_t *parent)
     lv_obj_set_style_text_align(s_bright_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_bright_label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(s_bright_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_bright_label, LV_OBJ_FLAG_FLOATING);
 
     /* Hint text */
     lv_obj_t *hint = lv_label_create(page);
