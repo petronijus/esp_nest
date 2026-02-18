@@ -55,10 +55,6 @@ static int s_current = 0;
 static bool s_animating = false;
 static lv_obj_t *s_status_label = NULL;
 
-/* Background glow image refs (hidden during transitions for performance) */
-static lv_obj_t *s_glow_yellow = NULL;
-static lv_obj_t *s_glow_teal = NULL;
-
 /* Brightness detail page widgets */
 static lv_obj_t *s_bright_page = NULL;
 static lv_obj_t *s_bright_outer = NULL;
@@ -231,7 +227,7 @@ static lv_obj_t *build_lights_page(lv_obj_t *parent)
     lv_obj_t *page = create_page_container(parent);
 
     /* Background glow -- yellow at top */
-    s_glow_yellow = create_image(page, &bg_glow_yellow, LV_ALIGN_TOP_MID, 0, 0);
+    create_image(page, &bg_glow_yellow, LV_ALIGN_TOP_MID, 0, 0);
 
     create_dot(page, true, COL_YELLOW, LV_ALIGN_TOP_MID, 77);
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_BOTTOM_MID, -77);
@@ -245,7 +241,7 @@ static lv_obj_t *build_fan_page(lv_obj_t *parent)
     lv_obj_t *page = create_page_container(parent);
 
     /* Background glow -- teal at bottom */
-    s_glow_teal = create_image(page, &bg_glow_teal, LV_ALIGN_BOTTOM_MID, 0, 0);
+    create_image(page, &bg_glow_teal, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_TOP_MID, 77);
     create_dot(page, true, COL_TEAL, LV_ALIGN_BOTTOM_MID, -77);
@@ -414,20 +410,6 @@ static void fade_opa_cb(void *obj, int32_t value)
     lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
 }
 
-static void hide_glow_images(void)
-{
-    if (s_glow_yellow) lv_obj_add_flag(s_glow_yellow, LV_OBJ_FLAG_HIDDEN);
-    if (s_glow_teal)   lv_obj_add_flag(s_glow_teal, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void show_current_glow(void)
-{
-    if (s_current == 0 && s_glow_yellow)
-        lv_obj_clear_flag(s_glow_yellow, LV_OBJ_FLAG_HIDDEN);
-    if (s_current == 1 && s_glow_teal)
-        lv_obj_clear_flag(s_glow_teal, LV_OBJ_FLAG_HIDDEN);
-}
-
 static void hide_gradient_arcs(void)
 {
     for (int i = 0; i < GRADIENT_LAYERS; i++)
@@ -460,7 +442,6 @@ static void fade_out_done_cb(lv_anim_t *a)
 
 static void fade_in_done_cb(lv_anim_t *a)
 {
-    show_current_glow();
     s_animating = false;
 }
 
@@ -497,7 +478,6 @@ static void fade_transition(lv_obj_t *from, lv_obj_t *to)
     if (s_animating) return;
     s_animating = true;
 
-    hide_glow_images();
     s_fade_out_target = from;
 
     /* Fade out visible children of departing page */
@@ -541,7 +521,6 @@ static void exit_bright_done_cb(lv_anim_t *a)
     lv_obj_set_style_opa(s_bright_hint, LV_OPA_COVER, 0);
     update_brightness_display();
     show_gradient_arcs();
-    show_current_glow();
     s_animating = false;
 }
 
@@ -581,7 +560,6 @@ static void enter_brightness_mode(void)
     s_animating = true;
 
     hide_gradient_arcs();
-    hide_glow_images();
     update_brightness_display();
 
     int target_diam = s_brightness > 0
@@ -739,7 +717,6 @@ static void exit_fan_done_cb(lv_anim_t *a)
     lv_obj_set_style_opa(s_fan_hint, LV_OPA_COVER, 0);
     update_fan_display();
     show_gradient_arcs();
-    show_current_glow();
     s_animating = false;
 }
 
@@ -751,7 +728,6 @@ static void enter_fan_mode(void)
     s_fan_accum = 0;
 
     hide_gradient_arcs();
-    hide_glow_images();
     update_fan_display();
 
     /* Set circles to starting sizes (proportional to menu circle) */
@@ -868,12 +844,12 @@ void ui_init(void)
     lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_screen, LV_SCROLLBAR_MODE_OFF);
 
-    /* Gradient arc (behind pages, rotates with page switch) */
-    init_gradient_arcs(s_screen);
-
     /* Build menu pages */
     s_pages[0] = build_lights_page(s_screen);
     s_pages[1] = build_fan_page(s_screen);
+
+    /* Gradient arc (on top of menu pages so it's visible over opaque glow images) */
+    init_gradient_arcs(s_screen);
 
     /* Build brightness detail page (initially hidden) */
     s_bright_page = build_brightness_page(s_screen);
