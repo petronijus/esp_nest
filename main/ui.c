@@ -19,7 +19,7 @@ static const char *TAG = "ui";
 
 /* Brightness detail screen constants */
 #define BRIGHT_OUTER_DIAM   456
-#define BRIGHT_CIRCLE_MAX   420
+#define BRIGHT_CIRCLE_MAX   456
 #define BRIGHT_CIRCLE_MIN   10
 
 /* ========================================================================== */
@@ -28,8 +28,6 @@ static const char *TAG = "ui";
 
 extern const lv_image_dsc_t bg_glow_yellow;
 extern const lv_image_dsc_t bg_glow_teal;
-extern const lv_image_dsc_t circle_glow_yellow;
-extern const lv_image_dsc_t circle_glow_teal;
 extern const lv_image_dsc_t lights;
 extern const lv_image_dsc_t fiiuuu;
 
@@ -64,14 +62,83 @@ static lv_obj_t *s_bright_circle = NULL;
 static lv_obj_t *s_bright_label = NULL;
 static lv_obj_t *s_bright_hint = NULL;
 
-/* Lights page widgets for brightness transition */
-static lv_obj_t *s_lights_circle = NULL;
 
 /* Fan detail page widgets */
 static lv_obj_t *s_fan_page = NULL;
 static lv_obj_t *s_fan_circles[3];   /* [0]=outer(456), [1]=mid(281), [2]=small(126) */
 static lv_obj_t *s_fan_label = NULL;
 static lv_obj_t *s_fan_hint = NULL;
+
+/* ========================================================================== */
+/*  Animated gradient arc (screen-level, rotates + changes color)             */
+/* ========================================================================== */
+
+#define GRADIENT_LAYERS 7
+
+static lv_obj_t *s_gradient_arcs[GRADIENT_LAYERS];
+
+static const struct { int half_span; lv_opa_t opa; } arc_layer_defs[GRADIENT_LAYERS] = {
+    {90,  13},              /* ~5% */
+    {75,  LV_OPA_10},
+    {60,  38},              /* ~15% */
+    {45,  64},              /* ~25% */
+    {30,  LV_OPA_40},
+    {18,  LV_OPA_60},
+    {8,   LV_OPA_80},
+};
+
+static int s_arc_from_deg;
+static int s_arc_delta_deg;
+
+static void update_gradient_arcs(int center_deg, lv_color_t color)
+{
+    center_deg = ((center_deg % 360) + 360) % 360;
+    for (int i = 0; i < GRADIENT_LAYERS; i++) {
+        int start = (center_deg - arc_layer_defs[i].half_span + 360) % 360;
+        int end   = (center_deg + arc_layer_defs[i].half_span) % 360;
+        lv_arc_set_bg_angles(s_gradient_arcs[i], start, end);
+        lv_obj_set_style_arc_color(s_gradient_arcs[i], color, LV_PART_MAIN);
+    }
+}
+
+static void init_gradient_arcs(lv_obj_t *parent)
+{
+    for (int i = 0; i < GRADIENT_LAYERS; i++) {
+        lv_obj_t *arc = lv_arc_create(parent);
+        lv_obj_remove_style_all(arc);
+        lv_obj_set_size(arc, CIRCLE_DIAM, CIRCLE_DIAM);
+        lv_obj_add_flag(arc, LV_OBJ_FLAG_FLOATING);
+
+        lv_arc_set_rotation(arc, 0);
+        lv_arc_set_range(arc, 0, 100);
+        lv_arc_set_value(arc, 0);
+
+        lv_obj_set_style_arc_width(arc, 2, LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(arc, arc_layer_defs[i].opa, LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(arc, false, LV_PART_MAIN);
+
+        lv_obj_set_style_arc_opa(arc, LV_OPA_TRANSP, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, LV_PART_KNOB);
+        lv_obj_set_style_pad_all(arc, 0, LV_PART_KNOB);
+
+        lv_obj_align(arc, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        s_gradient_arcs[i] = arc;
+    }
+
+    update_gradient_arcs(270, COL_YELLOW);
+}
+
+static void arc_rotate_anim_cb(void *var, int32_t progress)
+{
+    int deg = s_arc_from_deg + s_arc_delta_deg * progress / 255;
+    uint8_t mix = (uint8_t)progress;
+    lv_color_t from_col = (s_arc_delta_deg > 0) ? COL_YELLOW : COL_TEAL;
+    lv_color_t to_col   = (s_arc_delta_deg > 0) ? COL_TEAL   : COL_YELLOW;
+    lv_color_t color = lv_color_mix(to_col, from_col, mix);
+    update_gradient_arcs(deg, color);
+}
 
 /* ========================================================================== */
 /*  Image helpers                                                             */
@@ -104,21 +171,6 @@ static lv_obj_t *create_page_container(lv_obj_t *parent)
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_pad_all(page, 0, 0);
     return page;
-}
-
-static lv_obj_t *create_circle_outline(lv_obj_t *parent)
-{
-    lv_obj_t *circle = lv_obj_create(parent);
-    lv_obj_remove_style_all(circle);
-    lv_obj_set_size(circle, CIRCLE_DIAM, CIRCLE_DIAM);
-    lv_obj_set_style_radius(circle, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(circle, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(circle, 1, 0);
-    lv_obj_set_style_border_color(circle, COL_CIRCLE, 0);
-    lv_obj_set_style_border_opa(circle, LV_OPA_60, 0);
-    lv_obj_align(circle, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_clear_flag(circle, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    return circle;
 }
 
 static lv_obj_t *create_dot(lv_obj_t *parent, bool filled, lv_color_t color,
@@ -174,11 +226,6 @@ static lv_obj_t *build_lights_page(lv_obj_t *parent)
     /* Background glow -- yellow at top */
     create_image(page, &bg_glow_yellow, LV_ALIGN_TOP_MID, 0, 0);
 
-    s_lights_circle = create_circle_outline(page);
-
-    /* Circle glow behind the outline */
-    create_image(page, &circle_glow_yellow, LV_ALIGN_CENTER, 0, 0);
-
     create_dot(page, true, COL_YELLOW, LV_ALIGN_TOP_MID, 77);
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_BOTTOM_MID, -77);
     create_title(page, "Lights", &lights);
@@ -192,11 +239,6 @@ static lv_obj_t *build_fan_page(lv_obj_t *parent)
 
     /* Background glow -- teal at bottom */
     create_image(page, &bg_glow_teal, LV_ALIGN_BOTTOM_MID, 0, 0);
-
-    create_circle_outline(page);
-
-    /* Circle glow behind the outline */
-    create_image(page, &circle_glow_teal, LV_ALIGN_CENTER, 0, 0);
 
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_TOP_MID, 77);
     create_dot(page, true, COL_TEAL, LV_ALIGN_BOTTOM_MID, -77);
@@ -443,7 +485,7 @@ static void exit_bright_done_cb(lv_anim_t *a)
     s_animating = false;
 }
 
-static void switch_page(int new_idx)
+static void switch_page(int new_idx, int dir)
 {
     if (new_idx < 0) new_idx = SCREEN_COUNT - 1;
     if (new_idx >= SCREEN_COUNT) new_idx = 0;
@@ -451,6 +493,20 @@ static void switch_page(int new_idx)
     if (s_animating) return;
 
     fade_transition(s_pages[s_current], s_pages[new_idx]);
+
+    /* Rotate gradient arc: CW for forward, CCW for backward */
+    s_arc_from_deg = (s_current == 0) ? 270 : 90;
+    s_arc_delta_deg = (dir > 0) ? 180 : -180;
+
+    lv_anim_t arc_anim;
+    lv_anim_init(&arc_anim);
+    lv_anim_set_var(&arc_anim, NULL);
+    lv_anim_set_values(&arc_anim, 0, 255);
+    lv_anim_set_exec_cb(&arc_anim, arc_rotate_anim_cb);
+    lv_anim_set_duration(&arc_anim, FADE_TIME_MS);
+    lv_anim_set_path_cb(&arc_anim, lv_anim_path_ease_in_out);
+    lv_anim_start(&arc_anim);
+
     s_current = new_idx;
 }
 
@@ -774,6 +830,9 @@ void ui_init(void)
     lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_screen, LV_SCROLLBAR_MODE_OFF);
 
+    /* Gradient arc (behind pages, rotates with page switch) */
+    init_gradient_arcs(s_screen);
+
     /* Build menu pages */
     s_pages[0] = build_lights_page(s_screen);
     s_pages[1] = build_fan_page(s_screen);
@@ -822,7 +881,7 @@ void ui_encoder_navigate(int diff)
     if (diff == 0) return;
 
     if (s_mode == UI_MODE_BRIGHTNESS) {
-        s_brightness -= diff;  /* opposite rotation to encoder */
+        s_brightness -= diff * 2;
         if (s_brightness < 0) s_brightness = 0;
         if (s_brightness > 100) s_brightness = 100;
         update_brightness_display();
@@ -841,7 +900,7 @@ void ui_encoder_navigate(int diff)
         }
     } else {
         int next = s_current + (diff > 0 ? 1 : -1);
-        switch_page(next);
+        switch_page(next, diff > 0 ? 1 : -1);
     }
 }
 

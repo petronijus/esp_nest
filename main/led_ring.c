@@ -22,24 +22,31 @@ static void led_ring_task(void *arg)
     uint32_t tick = 0;
 
     for (;;) {
-        /* Smooth sine-wave breathing: oscillate between MIN and MAX brightness */
-        float phase = (float)(tick % BREATH_PERIOD_MS) / (float)BREATH_PERIOD_MS;
-        float breath = MIN_BRIGHTNESS +
-                        (MAX_BRIGHTNESS - MIN_BRIGHTNESS) *
-                        (0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI));
-
-        /* Pick color based on current UI page */
         uint8_t r, g, b;
-        if (ui_get_current_page() == 0) {
-            /* Yellow: #FFE600 */
-            r = (uint8_t)(255.0f * breath);
-            g = (uint8_t)(230.0f * breath);
+
+        if (ui_get_current_page() == 0 && ui_is_detail_mode()) {
+            /* Brightness detail: intensity tracks brightness value directly */
+            float level = (float)ui_get_brightness() / 100.0f;
+            r = (uint8_t)(255.0f * level);
+            g = (uint8_t)(230.0f * level);
             b = 0;
         } else {
-            /* Teal: #00E5CC */
-            r = 0;
-            g = (uint8_t)(229.0f * breath);
-            b = (uint8_t)(204.0f * breath);
+            /* Menu mode: breathing animation */
+            float phase = (float)(tick % BREATH_PERIOD_MS) / (float)BREATH_PERIOD_MS;
+            float breath = MIN_BRIGHTNESS +
+                            (MAX_BRIGHTNESS - MIN_BRIGHTNESS) *
+                            (0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI));
+            if (ui_get_current_page() == 0) {
+                /* Yellow: #FFE600 */
+                r = (uint8_t)(255.0f * breath);
+                g = (uint8_t)(230.0f * breath);
+                b = 0;
+            } else {
+                /* Teal: #00E5CC */
+                r = 0;
+                g = (uint8_t)(229.0f * breath);
+                b = (uint8_t)(204.0f * breath);
+            }
         }
 
         for (int i = 0; i < NUM_LEDS; i++) {
