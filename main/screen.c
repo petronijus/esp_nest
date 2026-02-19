@@ -10,6 +10,7 @@
 #include "esp_lcd_panel_rgb.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/ledc.h"
 #include "lvgl.h"
 
 #include "board.h"
@@ -21,6 +22,21 @@ static const char *TAG = "screen";
 
 #define ECO_O(y)    ((y) > 0 ? -1 : 1)
 #define ECO_STEP(x) ((x) ? ECO_O(x) : 0)
+
+/* Backlight PWM */
+#define BL_LEDC_TIMER       LEDC_TIMER_0
+#define BL_LEDC_CHANNEL     LEDC_CHANNEL_0
+#define BL_LEDC_FREQ_HZ     5000
+#define BL_LEDC_RESOLUTION  LEDC_TIMER_13_BIT
+#define BL_MAX_DUTY         ((1 << 13) - 1)
+
+#define BL_ACTIVE_PERCENT   100
+#define BL_DIM_PERCENT      20
+#define BL_IDLE_TIMEOUT_MS  30000
+#define BL_FADE_MS          1000
+
+static uint32_t s_last_activity_ms = 0;
+static bool s_bl_dimmed = false;
 
 static esp_lcd_panel_handle_t g_panel_handle = NULL;
 static button_t *g_btn = NULL;
@@ -324,6 +340,47 @@ static void spi_init_display_controller(void)
 }
 
 /* ========================================================================== */
+/*  Backlight (LEDC PWM)                                                      */
+/* ========================================================================== */
+
+static void backlight_init(void)
+{
+    ledc_timer_config_t timer_conf = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .timer_num       = BL_LEDC_TIMER,
+        .duty_resolution = BL_LEDC_RESOLUTION,
+        .freq_hz         = BL_LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
+
+    ledc_channel_config_t channel_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = BL_LEDC_CHANNEL,
+        .timer_sel  = BL_LEDC_TIMER,
+        .gpio_num   = LCD_PIN_BK_LIGHT,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_conf));
+    ESP_ERROR_CHECK(ledc_fade_func_install(0));
+}
+
+static void backlight_set(int percent)
+{
+    uint32_t duty = ((uint32_t)BL_MAX_DUTY * percent) / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
+}
+
+static void backlight_fade_to(int percent, int fade_ms)
+{
+    uint32_t duty = ((uint32_t)BL_MAX_DUTY * percent) / 100;
+    ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty, fade_ms);
+    ledc_fade_start(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, LEDC_FADE_NO_WAIT);
+}
+
+/* ========================================================================== */
 /*  RGB panel + LVGL display setup                                            */
 /* ========================================================================== */
 
@@ -420,10 +477,8 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         accum = 0;
     } else if (diff != 0) {
         if (detail) {
-            /* In detail mode: each tick changes brightness by 1 */
             ui_encoder_navigate(diff);
         } else {
-            /* In menu mode: accumulate 3 ticks before switching */
             accum += diff;
             if (accum >= 3) {
                 ui_encoder_navigate(1);
@@ -460,6 +515,19 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         cooldown_until = now_ms + 300;
     }
 
+    /* --- Backlight idle dimming --- */
+    bool activity = (diff != 0) || pressed;
+    if (activity) {
+        s_last_activity_ms = now_ms;
+        if (s_bl_dimmed) {
+            backlight_set(BL_ACTIVE_PERCENT);
+            s_bl_dimmed = false;
+        }
+    } else if (!s_bl_dimmed && now_ms - s_last_activity_ms >= BL_IDLE_TIMEOUT_MS) {
+        backlight_fade_to(BL_DIM_PERCENT, BL_FADE_MS);
+        s_bl_dimmed = true;
+    }
+
     was_pressed = pressed;
     data->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
@@ -485,13 +553,8 @@ static void encoder_init(void)
 
 void screen_init(void)
 {
-    /* Configure backlight GPIO */
-    gpio_config_t bk_gpio_config = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << LCD_PIN_BK_LIGHT,
-    };
-    ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
-    ESP_ERROR_CHECK(gpio_set_level(LCD_PIN_BK_LIGHT, LCD_BK_LIGHT_OFF_LEVEL));
+    /* Configure backlight PWM (off during init to hide garbage frames) */
+    backlight_init();
 
     /* Initialize the display controller via SPI */
     spi_init_display_controller();
@@ -502,7 +565,8 @@ void screen_init(void)
     /* Initialize encoder input */
     encoder_init();
 
-    /* Turn on backlight */
-    ESP_ERROR_CHECK(gpio_set_level(LCD_PIN_BK_LIGHT, LCD_BK_LIGHT_ON_LEVEL));
+    /* Turn on backlight at full brightness */
+    backlight_set(BL_ACTIVE_PERCENT);
+    s_bl_dimmed = false;
     ESP_LOGI(TAG, "Screen initialization complete");
 }
