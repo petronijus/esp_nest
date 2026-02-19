@@ -60,7 +60,7 @@ void app_main(void)
     ESP_LOGI(TAG, "ESP Nest starting...");
 
     /* Start LVGL on core 1 */
-    xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8 * 1024, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(lvgl_task, "lvgl", 16 * 1024, NULL, 5, NULL, 1);
     vTaskDelay(pdMS_TO_TICKS(500));
 
     /* --- WiFi --- */
