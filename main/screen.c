@@ -11,6 +11,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
+#include "esp_heap_caps.h"
 #include "lvgl.h"
 
 #include "board.h"
@@ -39,6 +40,7 @@ static uint32_t s_last_activity_ms = 0;
 static bool s_bl_dimmed = false;
 
 static esp_lcd_panel_handle_t g_panel_handle = NULL;
+static uint16_t *s_fb = NULL;
 static button_t *g_btn = NULL;
 
 /* ========================================================================== */
@@ -61,15 +63,20 @@ static bool IRAM_ATTR vsync_callback(esp_lcd_panel_handle_t panel,
 
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    int x1 = area->x1;
-    int y1 = area->y1;
-    int x2 = area->x2;
-    int y2 = area->y2;
+    int32_t w = lv_area_get_width(area);
+    int32_t h = lv_area_get_height(area);
+    const uint16_t *src = (const uint16_t *)px_map;
 
-    /* Wait for previous VSYNC before swapping buffers */
-    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
+    for (int32_t y = 0; y < h; y++) {
+        int32_t dst_y = (LCD_V_RES - 1 - area->y1) - y;
+        int32_t dst_x_start = LCD_H_RES - 1 - area->x1;
+        const uint16_t *src_row = src + y * w;
+        uint16_t *dst_row = s_fb + dst_y * LCD_H_RES;
+        for (int32_t x = 0; x < w; x++) {
+            dst_row[dst_x_start - x] = src_row[x];
+        }
+    }
 
-    esp_lcd_panel_draw_bitmap(g_panel_handle, x1, y1, x2 + 1, y2 + 1, px_map);
     lv_display_flush_ready(disp);
 }
 
@@ -415,7 +422,7 @@ static void rgb_panel_init(void)
             .vsync_front_porch = 14,
         },
         .flags.fb_in_psram = 1,
-        .flags.double_fb = 1,
+        .flags.double_fb = 0,
         .flags.refresh_on_demand = 0,
         .bounce_buffer_size_px = 10 * LCD_H_RES,
     };
@@ -430,22 +437,22 @@ static void rgb_panel_init(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel_handle));
-    ESP_LOGI(TAG, "RGB panel initialized (%dx%d) with bounce buffer", LCD_H_RES, LCD_V_RES);
+    ESP_LOGI(TAG, "RGB panel initialized (%dx%d) rotated 180°", LCD_H_RES, LCD_V_RES);
 
-    /* Get the double frame buffers allocated in PSRAM */
-    void *buf1 = NULL;
-    void *buf2 = NULL;
-    esp_lcd_rgb_panel_get_frame_buffer(g_panel_handle, 2, &buf1, &buf2);
+    /* Get the single framebuffer for direct pixel writes */
+    void *fb = NULL;
+    esp_lcd_rgb_panel_get_frame_buffer(g_panel_handle, 1, &fb);
+    s_fb = (uint16_t *)fb;
 
     /* Initialize LVGL */
     lv_init();
 
-    /* Create LVGL display with full-frame double buffering */
+    /* PARTIAL mode: small render buffer, flush writes rotated pixels to FB */
+    static lv_color_t lvgl_buf[LCD_H_RES * 30];
     s_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_flush_cb(s_disp, lvgl_flush_cb);
-    lv_display_set_buffers(s_disp, buf1, buf2,
-                           LCD_H_RES * LCD_V_RES * sizeof(lv_color_t),
-                           LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_display_set_buffers(s_disp, lvgl_buf, NULL, sizeof(lvgl_buf),
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     ESP_LOGI(TAG, "LVGL display driver registered");
 }
