@@ -502,12 +502,13 @@ static void subscribe_all(void)
 {
     esp_mqtt_client_subscribe(s_client, FAN_TOPIC, 1);
     esp_mqtt_client_subscribe(s_client, Z2M_LIGHT_TOPIC, 1);
+    esp_mqtt_client_subscribe(s_client, "homeassistant/status", 1);
 
     char topic[128];
     snprintf(topic, sizeof(topic), "%s/cmd/#", s_base_topic);
     esp_mqtt_client_subscribe(s_client, topic, 1);
 
-    ESP_LOGI(TAG, "Subscribed to fan, light, and command topics");
+    ESP_LOGI(TAG, "Subscribed to fan, light, HA status, and command topics");
 }
 
 static void request_current_state(void)
@@ -553,8 +554,17 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
             handle_fan_message(event->data, event->data_len);
         } else if (strcmp(topic_buf, Z2M_LIGHT_TOPIC) == 0) {
             handle_light_message(event->data, event->data_len);
+        } else if (strcmp(topic_buf, "homeassistant/status") == 0) {
+            char status[16] = {0};
+            int slen = event->data_len < (int)sizeof(status) - 1
+                       ? event->data_len : (int)sizeof(status) - 1;
+            memcpy(status, event->data, slen);
+            if (strcmp(status, "online") == 0) {
+                ESP_LOGI(TAG, "HA birth message received, re-publishing discovery");
+                publish_ha_discovery();
+                publish_device_state();
+            }
         } else {
-            /* Device command: extract subtopic after "espnest/<id>/cmd/" */
             char cmd_prefix[64];
             snprintf(cmd_prefix, sizeof(cmd_prefix), "%s/cmd/", s_base_topic);
             if (strncmp(topic_buf, cmd_prefix, strlen(cmd_prefix)) == 0) {

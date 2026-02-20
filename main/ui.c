@@ -51,6 +51,9 @@ static ui_change_cb_t s_change_cb = NULL;
 static volatile int s_pending_brightness = -1;
 static volatile int s_pending_fan = -1;
 
+#define DETAIL_IDLE_TIMEOUT_MS 60000
+static uint32_t s_detail_last_activity = 0;
+
 static void notify_change(ui_event_type_t type, int value)
 {
     if (s_change_cb) s_change_cb(type, value);
@@ -565,6 +568,8 @@ static void enter_brightness_mode(void)
     s_mode = UI_MODE_BRIGHTNESS;
     s_animating = true;
 
+    s_detail_last_activity = lv_tick_get();
+
     if (s_brightness == 0) {
         s_brightness = s_last_nonzero_brightness > 0 ? s_last_nonzero_brightness : 100;
         notify_change(UI_EVT_BRIGHTNESS, s_brightness);
@@ -738,6 +743,8 @@ static void enter_fan_mode(void)
     s_animating = true;
     s_fan_accum = 0;
 
+    s_detail_last_activity = lv_tick_get();
+
     hide_arc();
     update_fan_display();
 
@@ -900,6 +907,9 @@ void ui_encoder_navigate(int diff)
 {
     if (diff == 0) return;
 
+    if (s_mode != UI_MODE_MENU)
+        s_detail_last_activity = lv_tick_get();
+
     if (s_mode == UI_MODE_BRIGHTNESS) {
         s_brightness -= diff * 2;
         if (s_brightness < 0) s_brightness = 0;
@@ -930,6 +940,9 @@ void ui_encoder_navigate(int diff)
 
 void ui_encoder_press(void)
 {
+    if (s_mode != UI_MODE_MENU)
+        s_detail_last_activity = lv_tick_get();
+
     if (s_mode == UI_MODE_MENU) {
         if (s_current == 0) {
             enter_brightness_mode();
@@ -1016,6 +1029,17 @@ void ui_process_pending(void)
         if (fan != s_fan_level) {
             s_fan_level = fan;
             if (s_mode == UI_MODE_FAN) update_fan_display();
+        }
+    }
+
+    if (s_mode != UI_MODE_MENU && !s_animating) {
+        uint32_t elapsed = lv_tick_elaps(s_detail_last_activity);
+        if (elapsed >= DETAIL_IDLE_TIMEOUT_MS) {
+            ESP_LOGI(TAG, "Detail screen idle timeout, returning to menu");
+            if (s_mode == UI_MODE_BRIGHTNESS)
+                exit_brightness_mode();
+            else if (s_mode == UI_MODE_FAN)
+                exit_fan_mode();
         }
     }
 }
