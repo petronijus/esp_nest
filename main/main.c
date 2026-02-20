@@ -13,6 +13,15 @@
 
 static const char *TAG = "main";
 
+static void ui_change_handler(ui_event_type_t type, int value)
+{
+    if (type == UI_EVT_BRIGHTNESS) {
+        ha_mqtt_publish_light();
+    } else if (type == UI_EVT_FAN) {
+        ha_mqtt_publish_fan();
+    }
+}
+
 static void lvgl_tick_cb(void *arg)
 {
     lv_tick_inc(2);
@@ -31,8 +40,8 @@ static void lvgl_task(void *arg)
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, 2000));
 
-    /* Build the Figma-based UI */
     ui_init();
+    ui_register_change_cb(ui_change_handler);
     ui_set_status("Starting...");
 
     ESP_LOGI(TAG, "Entering LVGL main loop");

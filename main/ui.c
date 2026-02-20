@@ -45,6 +45,8 @@ typedef enum {
 
 static ui_mode_t s_mode = UI_MODE_MENU;
 static int s_brightness = 30;
+static int s_last_nonzero_brightness = 100;
+static ui_change_cb_t s_change_cb = NULL;
 
 /* Fan detail state: 0=off, 1=low, 2=medium, 3=high */
 static int s_fan_level = 0;
@@ -881,6 +883,11 @@ void ui_set_status(const char *text)
     }
 }
 
+static void notify_change(ui_event_type_t type, int value)
+{
+    if (s_change_cb) s_change_cb(type, value);
+}
+
 void ui_encoder_navigate(int diff)
 {
     if (diff == 0) return;
@@ -889,19 +896,23 @@ void ui_encoder_navigate(int diff)
         s_brightness -= diff * 2;
         if (s_brightness < 0) s_brightness = 0;
         if (s_brightness > 100) s_brightness = 100;
+        if (s_brightness > 0) s_last_nonzero_brightness = s_brightness;
         update_brightness_display();
+        notify_change(UI_EVT_BRIGHTNESS, s_brightness);
     } else if (s_mode == UI_MODE_FAN) {
-        s_fan_accum -= diff;  /* reversed so increase is opposite direction */
+        s_fan_accum -= diff;
         if (s_fan_accum >= 3) {
             s_fan_level++;
             if (s_fan_level > 3) s_fan_level = 3;
             s_fan_accum = 0;
             update_fan_display();
+            notify_change(UI_EVT_FAN, s_fan_level);
         } else if (s_fan_accum <= -3) {
             s_fan_level--;
             if (s_fan_level < 0) s_fan_level = 0;
             s_fan_accum = 0;
             update_fan_display();
+            notify_change(UI_EVT_FAN, s_fan_level);
         }
     } else {
         int next = s_current + (diff > 0 ? 1 : -1);
@@ -927,13 +938,19 @@ void ui_encoder_press(void)
 void ui_encoder_long_press(void)
 {
     if (s_mode == UI_MODE_BRIGHTNESS) {
-        s_brightness = 0;
+        if (s_brightness == 0) {
+            s_brightness = s_last_nonzero_brightness > 0 ? s_last_nonzero_brightness : 100;
+        } else {
+            s_brightness = 0;
+        }
         update_brightness_display();
-        ESP_LOGI(TAG, "Long press: brightness set to 0");
+        notify_change(UI_EVT_BRIGHTNESS, s_brightness);
+        ESP_LOGI(TAG, "Long press: brightness toggled to %d", s_brightness);
         exit_brightness_mode();
     } else if (s_mode == UI_MODE_FAN) {
         s_fan_level = 0;
         update_fan_display();
+        notify_change(UI_EVT_FAN, s_fan_level);
         ESP_LOGI(TAG, "Long press: fan set to off");
         exit_fan_mode();
     }
@@ -957,4 +974,32 @@ int ui_get_brightness(void)
 int ui_get_fan_level(void)
 {
     return s_fan_level;
+}
+
+void ui_set_brightness(int brightness)
+{
+    if (brightness < 0) brightness = 0;
+    if (brightness > 100) brightness = 100;
+    if (brightness == s_brightness) return;
+    s_brightness = brightness;
+    if (s_brightness > 0) s_last_nonzero_brightness = s_brightness;
+    if (s_mode == UI_MODE_BRIGHTNESS) {
+        update_brightness_display();
+    }
+}
+
+void ui_set_fan_level(int level)
+{
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    if (level == s_fan_level) return;
+    s_fan_level = level;
+    if (s_mode == UI_MODE_FAN) {
+        update_fan_display();
+    }
+}
+
+void ui_register_change_cb(ui_change_cb_t cb)
+{
+    s_change_cb = cb;
 }
