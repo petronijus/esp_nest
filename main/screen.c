@@ -31,10 +31,11 @@ static const char *TAG = "screen";
 #define BL_LEDC_RESOLUTION  LEDC_TIMER_13_BIT
 #define BL_MAX_DUTY         ((1 << 13) - 1)
 
-#define BL_ACTIVE_PERCENT   100
-#define BL_DIM_PERCENT      20
-#define BL_IDLE_TIMEOUT_MS  30000
 #define BL_FADE_MS          1000
+
+static int s_bl_active_percent = 100;
+static int s_bl_dim_percent = 20;
+static int s_bl_idle_timeout_ms = 30000;
 
 static uint32_t s_last_activity_ms = 0;
 static bool s_bl_dimmed = false;
@@ -527,11 +528,12 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     if (activity) {
         s_last_activity_ms = now_ms;
         if (s_bl_dimmed) {
-            backlight_set(BL_ACTIVE_PERCENT);
+            backlight_set(s_bl_active_percent);
             s_bl_dimmed = false;
         }
-    } else if (!s_bl_dimmed && now_ms - s_last_activity_ms >= BL_IDLE_TIMEOUT_MS) {
-        backlight_fade_to(BL_DIM_PERCENT, BL_FADE_MS);
+    } else if (!s_bl_dimmed && s_bl_idle_timeout_ms > 0 &&
+               now_ms - s_last_activity_ms >= (uint32_t)s_bl_idle_timeout_ms) {
+        backlight_fade_to(s_bl_dim_percent, BL_FADE_MS);
         s_bl_dimmed = true;
     }
 
@@ -573,7 +575,36 @@ void screen_init(void)
     encoder_init();
 
     /* Turn on backlight at full brightness */
-    backlight_set(BL_ACTIVE_PERCENT);
+    backlight_set(s_bl_active_percent);
     s_bl_dimmed = false;
     ESP_LOGI(TAG, "Screen initialization complete");
+}
+
+int screen_get_backlight(void) { return s_bl_active_percent; }
+
+void screen_set_backlight(int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    s_bl_active_percent = percent;
+    if (!s_bl_dimmed) backlight_set(percent);
+}
+
+int screen_get_dim_level(void) { return s_bl_dim_percent; }
+
+void screen_set_dim_level(int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    s_bl_dim_percent = percent;
+    if (s_bl_dimmed) backlight_set(percent);
+}
+
+int screen_get_idle_timeout(void) { return s_bl_idle_timeout_ms / 1000; }
+
+void screen_set_idle_timeout(int seconds)
+{
+    if (seconds < 0) seconds = 0;
+    if (seconds > 600) seconds = 600;
+    s_bl_idle_timeout_ms = seconds * 1000;
 }

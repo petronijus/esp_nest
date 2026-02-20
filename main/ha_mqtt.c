@@ -13,9 +13,12 @@
 #include "esp_wifi.h"
 #include "esp_app_desc.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "mqtt_client.h"
 #include "wifi.h"
 #include "ui.h"
+#include "screen.h"
+#include "led_ring.h"
 
 static const char *TAG = "ha_mqtt";
 
@@ -104,7 +107,24 @@ static bool str_eq_icase(const char *a, const char *b)
 }
 
 /* ====================================================================== */
-/*  Publishing                                                             */
+/*  Topic helpers                                                          */
+/* ====================================================================== */
+
+static char s_base_topic[48];   /* "espnest/<id>" */
+static char s_avail_topic[64];
+static char s_state_topic[64];
+static char s_cmd_topic[64];
+
+static void build_topics(void)
+{
+    snprintf(s_base_topic,  sizeof(s_base_topic),  "espnest/%s", s_device_id);
+    snprintf(s_avail_topic, sizeof(s_avail_topic), "%s/avail",   s_base_topic);
+    snprintf(s_state_topic, sizeof(s_state_topic), "%s/state",   s_base_topic);
+    snprintf(s_cmd_topic,   sizeof(s_cmd_topic),   "%s/cmd/#",   s_base_topic);
+}
+
+/* ====================================================================== */
+/*  Publishing: controlled light                                           */
 /* ====================================================================== */
 
 static void publish_light_now(void)
@@ -175,6 +195,37 @@ void ha_mqtt_publish_fan(void)
 }
 
 /* ====================================================================== */
+/*  Publishing: device settings state                                      */
+/* ====================================================================== */
+
+static void publish_device_state(void)
+{
+    if (!s_connected || !s_client) return;
+
+    wifi_ap_record_t ap_info;
+    int8_t rssi = 0;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+        rssi = ap_info.rssi;
+
+    uint32_t uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    uint32_t free_heap = esp_get_free_heap_size() / 1024;
+
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"rssi\":%d,\"ip\":\"%s\",\"uptime\":%lu,"
+             "\"free_heap\":%lu,"
+             "\"backlight\":%d,\"dim_level\":%d,\"idle_timeout\":%d,"
+             "\"led_ring\":\"%s\"}",
+             rssi, wifi_get_ip_str(), (unsigned long)uptime,
+             (unsigned long)free_heap,
+             screen_get_backlight(), screen_get_dim_level(),
+             screen_get_idle_timeout(),
+             led_ring_get_enabled() ? "ON" : "OFF");
+
+    esp_mqtt_client_publish(s_client, s_state_topic, payload, 0, 0, 0);
+}
+
+/* ====================================================================== */
 /*  Incoming message handling                                              */
 /* ====================================================================== */
 
@@ -240,11 +291,36 @@ static void handle_light_message(const char *data, int len)
     }
 }
 
-static void handle_command(const char *topic, const char *data, int data_len)
+static void handle_device_command(const char *subtopic, const char *data, int len)
 {
-    if (strstr(topic, "cmd/restart")) {
+    char msg[64] = {0};
+    int n = len < (int)sizeof(msg) - 1 ? len : (int)sizeof(msg) - 1;
+    memcpy(msg, data, n);
+    msg[n] = '\0';
+
+    if (strcmp(subtopic, "restart") == 0) {
         ESP_LOGW(TAG, "Restart command received");
         esp_restart();
+    } else if (strcmp(subtopic, "backlight") == 0) {
+        int val = atoi(msg);
+        screen_set_backlight(val);
+        ESP_LOGI(TAG, "Backlight set to %d", val);
+        publish_device_state();
+    } else if (strcmp(subtopic, "dim_level") == 0) {
+        int val = atoi(msg);
+        screen_set_dim_level(val);
+        ESP_LOGI(TAG, "Dim level set to %d", val);
+        publish_device_state();
+    } else if (strcmp(subtopic, "idle_timeout") == 0) {
+        int val = atoi(msg);
+        screen_set_idle_timeout(val);
+        ESP_LOGI(TAG, "Idle timeout set to %d s", val);
+        publish_device_state();
+    } else if (strcmp(subtopic, "led_ring") == 0) {
+        bool on = str_eq_icase(msg, "ON") || strcmp(msg, "1") == 0;
+        led_ring_set_enabled(on);
+        ESP_LOGI(TAG, "LED ring %s", on ? "ON" : "OFF");
+        publish_device_state();
     }
 }
 
@@ -255,84 +331,165 @@ static void handle_command(const char *topic, const char *data, int data_len)
 static void publish_ha_discovery(void)
 {
     char topic[128];
-    char payload[512];
+    char payload[700];
 
-    const char *dev_block =
+    const esp_app_desc_t *app = esp_app_get_description();
+    char dev_json[256];
+    snprintf(dev_json, sizeof(dev_json),
         "\"dev\":{"
             "\"ids\":[\"%s\"],"
             "\"name\":\"Nest Hub\","
             "\"mf\":\"Panlee\","
             "\"mdl\":\"ZX2D10GE01R-V4848\","
-            "\"sw\":\"%s\""
-        "}";
+            "\"sw\":\"%s\","
+            "\"cu\":\"http://%s/\""
+        "}",
+        s_device_id, app->version, wifi_get_ip_str());
 
-    const esp_app_desc_t *app = esp_app_get_description();
-    char dev_json[256];
-    snprintf(dev_json, sizeof(dev_json), dev_block, s_device_id, app->version);
+    /* --- Diagnostic sensors --- */
 
     snprintf(topic, sizeof(topic),
              "homeassistant/sensor/%s/rssi/config", s_device_id);
     snprintf(payload, sizeof(payload),
-             "{"
-                "\"name\":\"WiFi Signal\","
-                "\"uniq_id\":\"%s_rssi\","
-                "\"stat_t\":\"espnest/%s/state\","
-                "\"val_tpl\":\"{{ value_json.rssi }}\","
-                "\"unit_of_meas\":\"dBm\","
-                "\"dev_cla\":\"signal_strength\","
-                "\"ent_cat\":\"diagnostic\","
-                "\"avty_t\":\"espnest/%s/avail\","
-                "%s"
-             "}", s_device_id, s_device_id, s_device_id, dev_json);
+        "{\"name\":\"WiFi Signal\","
+         "\"uniq_id\":\"%s_rssi\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.rssi }}\","
+         "\"unit_of_meas\":\"dBm\","
+         "\"dev_cla\":\"signal_strength\","
+         "\"ent_cat\":\"diagnostic\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_avail_topic, dev_json);
     esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
 
     snprintf(topic, sizeof(topic),
              "homeassistant/sensor/%s/ip/config", s_device_id);
     snprintf(payload, sizeof(payload),
-             "{"
-                "\"name\":\"IP Address\","
-                "\"uniq_id\":\"%s_ip\","
-                "\"stat_t\":\"espnest/%s/state\","
-                "\"val_tpl\":\"{{ value_json.ip }}\","
-                "\"icon\":\"mdi:ip-network\","
-                "\"ent_cat\":\"diagnostic\","
-                "\"avty_t\":\"espnest/%s/avail\","
-                "%s"
-             "}", s_device_id, s_device_id, s_device_id, dev_json);
+        "{\"name\":\"IP Address\","
+         "\"uniq_id\":\"%s_ip\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.ip }}\","
+         "\"icon\":\"mdi:ip-network\","
+         "\"ent_cat\":\"diagnostic\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_avail_topic, dev_json);
     esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
 
     snprintf(topic, sizeof(topic),
              "homeassistant/sensor/%s/uptime/config", s_device_id);
     snprintf(payload, sizeof(payload),
-             "{"
-                "\"name\":\"Uptime\","
-                "\"uniq_id\":\"%s_uptime\","
-                "\"stat_t\":\"espnest/%s/state\","
-                "\"val_tpl\":\"{{ value_json.uptime }}\","
-                "\"unit_of_meas\":\"s\","
-                "\"icon\":\"mdi:timer-outline\","
-                "\"ent_cat\":\"diagnostic\","
-                "\"avty_t\":\"espnest/%s/avail\","
-                "%s"
-             "}", s_device_id, s_device_id, s_device_id, dev_json);
+        "{\"name\":\"Uptime\","
+         "\"uniq_id\":\"%s_uptime\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.uptime }}\","
+         "\"unit_of_meas\":\"s\","
+         "\"icon\":\"mdi:timer-outline\","
+         "\"ent_cat\":\"diagnostic\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_avail_topic, dev_json);
     esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
+
+    snprintf(topic, sizeof(topic),
+             "homeassistant/sensor/%s/heap/config", s_device_id);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"Free Heap\","
+         "\"uniq_id\":\"%s_heap\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.free_heap }}\","
+         "\"unit_of_meas\":\"KB\","
+         "\"icon\":\"mdi:memory\","
+         "\"ent_cat\":\"diagnostic\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_avail_topic, dev_json);
+    esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
+
+    /* --- Restart button --- */
 
     snprintf(topic, sizeof(topic),
              "homeassistant/button/%s/restart/config", s_device_id);
     snprintf(payload, sizeof(payload),
-             "{"
-                "\"name\":\"Restart\","
-                "\"uniq_id\":\"%s_restart\","
-                "\"cmd_t\":\"espnest/%s/cmd/restart\","
-                "\"icon\":\"mdi:restart\","
-                "\"ent_cat\":\"config\","
-                "\"avty_t\":\"espnest/%s/avail\","
-                "%s"
-             "}", s_device_id, s_device_id, s_device_id, dev_json);
+        "{\"name\":\"Restart\","
+         "\"uniq_id\":\"%s_restart\","
+         "\"cmd_t\":\"%s/cmd/restart\","
+         "\"icon\":\"mdi:restart\","
+         "\"ent_cat\":\"config\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_base_topic, s_avail_topic, dev_json);
     esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
 
-    snprintf(topic, sizeof(topic), "espnest/%s/avail", s_device_id);
-    esp_mqtt_client_publish(s_client, topic, "online", 0, 1, 1);
+    /* --- Screen Backlight (number, config) --- */
+
+    snprintf(topic, sizeof(topic),
+             "homeassistant/number/%s/backlight/config", s_device_id);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"Screen Brightness\","
+         "\"uniq_id\":\"%s_backlight\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.backlight }}\","
+         "\"cmd_t\":\"%s/cmd/backlight\","
+         "\"min\":1,\"max\":100,\"step\":5,"
+         "\"unit_of_meas\":\"%%\","
+         "\"icon\":\"mdi:brightness-6\","
+         "\"ent_cat\":\"config\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_base_topic, s_avail_topic, dev_json);
+    esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
+
+    /* --- Dim Level (number, config) --- */
+
+    snprintf(topic, sizeof(topic),
+             "homeassistant/number/%s/dim_level/config", s_device_id);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"Dim Brightness\","
+         "\"uniq_id\":\"%s_dim_level\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.dim_level }}\","
+         "\"cmd_t\":\"%s/cmd/dim_level\","
+         "\"min\":0,\"max\":100,\"step\":5,"
+         "\"unit_of_meas\":\"%%\","
+         "\"icon\":\"mdi:brightness-4\","
+         "\"ent_cat\":\"config\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_base_topic, s_avail_topic, dev_json);
+    esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
+
+    /* --- Idle Timeout (number, config) --- */
+
+    snprintf(topic, sizeof(topic),
+             "homeassistant/number/%s/idle_timeout/config", s_device_id);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"Idle Timeout\","
+         "\"uniq_id\":\"%s_idle_timeout\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.idle_timeout }}\","
+         "\"cmd_t\":\"%s/cmd/idle_timeout\","
+         "\"min\":0,\"max\":600,\"step\":5,"
+         "\"unit_of_meas\":\"s\","
+         "\"icon\":\"mdi:timer-sand\","
+         "\"ent_cat\":\"config\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_base_topic, s_avail_topic, dev_json);
+    esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
+
+    /* --- LED Ring (switch, config) --- */
+
+    snprintf(topic, sizeof(topic),
+             "homeassistant/switch/%s/led_ring/config", s_device_id);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"LED Ring\","
+         "\"uniq_id\":\"%s_led_ring\","
+         "\"stat_t\":\"%s\","
+         "\"val_tpl\":\"{{ value_json.led_ring }}\","
+         "\"cmd_t\":\"%s/cmd/led_ring\","
+         "\"icon\":\"mdi:led-on\","
+         "\"ent_cat\":\"config\","
+         "\"avty_t\":\"%s\",%s}",
+        s_device_id, s_state_topic, s_base_topic, s_avail_topic, dev_json);
+    esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
+
+    /* --- Availability --- */
+
+    esp_mqtt_client_publish(s_client, s_avail_topic, "online", 0, 1, 1);
 
     ESP_LOGI(TAG, "HA discovery published for '%s'", s_device_id);
 }
@@ -346,9 +503,9 @@ static void subscribe_all(void)
     esp_mqtt_client_subscribe(s_client, FAN_TOPIC, 1);
     esp_mqtt_client_subscribe(s_client, Z2M_LIGHT_TOPIC, 1);
 
-    char cmd_topic[128];
-    snprintf(cmd_topic, sizeof(cmd_topic), "espnest/%s/cmd/#", s_device_id);
-    esp_mqtt_client_subscribe(s_client, cmd_topic, 1);
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/cmd/#", s_base_topic);
+    esp_mqtt_client_subscribe(s_client, topic, 1);
 
     ESP_LOGI(TAG, "Subscribed to fan, light, and command topics");
 }
@@ -374,6 +531,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         publish_ha_discovery();
         subscribe_all();
         request_current_state();
+        publish_device_state();
         s_last_pub_brightness = -1;
         s_last_pub_fan = -1;
         break;
@@ -396,7 +554,13 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         } else if (strcmp(topic_buf, Z2M_LIGHT_TOPIC) == 0) {
             handle_light_message(event->data, event->data_len);
         } else {
-            handle_command(topic_buf, event->data, event->data_len);
+            /* Device command: extract subtopic after "espnest/<id>/cmd/" */
+            char cmd_prefix[64];
+            snprintf(cmd_prefix, sizeof(cmd_prefix), "%s/cmd/", s_base_topic);
+            if (strncmp(topic_buf, cmd_prefix, strlen(cmd_prefix)) == 0) {
+                const char *subtopic = topic_buf + strlen(cmd_prefix);
+                handle_device_command(subtopic, event->data, event->data_len);
+            }
         }
         break;
     }
@@ -417,19 +581,17 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
 esp_err_t ha_mqtt_init(void)
 {
     build_device_id();
+    build_topics();
     s_mqtt_event_group = xEventGroupCreate();
 
     s_light_timer = xTimerCreate("light_pub", pdMS_TO_TICKS(LIGHT_THROTTLE_MS),
                                   pdFALSE, NULL, light_timer_cb);
 
-    char lwt_topic[64];
-    snprintf(lwt_topic, sizeof(lwt_topic), "espnest/%s/avail", s_device_id);
-
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = CONFIG_MQTT_BROKER_URI,
         .credentials.username = CONFIG_MQTT_USERNAME,
         .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
-        .session.last_will.topic = lwt_topic,
+        .session.last_will.topic = s_avail_topic,
         .session.last_will.msg = "offline",
         .session.last_will.qos = 1,
         .session.last_will.retain = 1,
@@ -454,25 +616,7 @@ esp_err_t ha_mqtt_init(void)
 
 void ha_mqtt_publish_state(void)
 {
-    if (!s_connected || !s_client) return;
-
-    wifi_ap_record_t ap_info;
-    int8_t rssi = 0;
-    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-        rssi = ap_info.rssi;
-    }
-
-    uint32_t uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-
-    char topic[64];
-    snprintf(topic, sizeof(topic), "espnest/%s/state", s_device_id);
-
-    char payload[128];
-    snprintf(payload, sizeof(payload),
-             "{\"rssi\":%d,\"ip\":\"%s\",\"uptime\":%lu}",
-             rssi, wifi_get_ip_str(), (unsigned long)uptime);
-
-    esp_mqtt_client_publish(s_client, topic, payload, 0, 0, 0);
+    publish_device_state();
 }
 
 bool ha_mqtt_is_connected(void)

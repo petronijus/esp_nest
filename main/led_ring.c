@@ -16,13 +16,23 @@ static const char *TAG = "led_ring";
 #define MAX_BRIGHTNESS   0.45f
 
 static led_strip_handle_t s_strip = NULL;
+static volatile bool s_led_enabled = true;
 
 static void led_ring_task(void *arg)
 {
     uint32_t tick = 0;
 
     for (;;) {
-        uint8_t r, g, b;
+        uint8_t r = 0, g = 0, b = 0;
+
+        if (!s_led_enabled) {
+            for (int i = 0; i < NUM_LEDS; i++)
+                led_strip_set_pixel(s_strip, i, 0, 0, 0);
+            led_strip_refresh(s_strip);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            tick += 100;
+            continue;
+        }
 
         if (ui_get_current_page() == 0 && ui_is_detail_mode()) {
             /* Brightness detail: intensity tracks brightness value directly */
@@ -85,3 +95,7 @@ void led_ring_start(void)
 
     xTaskCreate(led_ring_task, "led_ring", 2048, NULL, 3, NULL);
 }
+
+bool led_ring_get_enabled(void) { return s_led_enabled; }
+
+void led_ring_set_enabled(bool enabled) { s_led_enabled = enabled; }

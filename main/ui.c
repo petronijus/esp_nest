@@ -48,6 +48,14 @@ static int s_brightness = 30;
 static int s_last_nonzero_brightness = 100;
 static ui_change_cb_t s_change_cb = NULL;
 
+static volatile int s_pending_brightness = -1;
+static volatile int s_pending_fan = -1;
+
+static void notify_change(ui_event_type_t type, int value)
+{
+    if (s_change_cb) s_change_cb(type, value);
+}
+
 /* Fan detail state: 0=off, 1=low, 2=medium, 3=high */
 static int s_fan_level = 0;
 static int s_fan_accum = 0;
@@ -557,6 +565,11 @@ static void enter_brightness_mode(void)
     s_mode = UI_MODE_BRIGHTNESS;
     s_animating = true;
 
+    if (s_brightness == 0) {
+        s_brightness = s_last_nonzero_brightness > 0 ? s_last_nonzero_brightness : 100;
+        notify_change(UI_EVT_BRIGHTNESS, s_brightness);
+    }
+
     hide_arc();
     update_brightness_display();
 
@@ -883,11 +896,6 @@ void ui_set_status(const char *text)
     }
 }
 
-static void notify_change(ui_event_type_t type, int value)
-{
-    if (s_change_cb) s_change_cb(type, value);
-}
-
 void ui_encoder_navigate(int diff)
 {
     if (diff == 0) return;
@@ -980,22 +988,35 @@ void ui_set_brightness(int brightness)
 {
     if (brightness < 0) brightness = 0;
     if (brightness > 100) brightness = 100;
-    if (brightness == s_brightness) return;
-    s_brightness = brightness;
-    if (s_brightness > 0) s_last_nonzero_brightness = s_brightness;
-    if (s_mode == UI_MODE_BRIGHTNESS) {
-        update_brightness_display();
-    }
+    s_pending_brightness = brightness;
 }
 
 void ui_set_fan_level(int level)
 {
     if (level < 0) level = 0;
     if (level > 3) level = 3;
-    if (level == s_fan_level) return;
-    s_fan_level = level;
-    if (s_mode == UI_MODE_FAN) {
-        update_fan_display();
+    s_pending_fan = level;
+}
+
+void ui_process_pending(void)
+{
+    int br = s_pending_brightness;
+    if (br >= 0) {
+        s_pending_brightness = -1;
+        if (br != s_brightness) {
+            s_brightness = br;
+            if (s_brightness > 0) s_last_nonzero_brightness = s_brightness;
+            if (s_mode == UI_MODE_BRIGHTNESS) update_brightness_display();
+        }
+    }
+
+    int fan = s_pending_fan;
+    if (fan >= 0) {
+        s_pending_fan = -1;
+        if (fan != s_fan_level) {
+            s_fan_level = fan;
+            if (s_mode == UI_MODE_FAN) update_fan_display();
+        }
     }
 }
 

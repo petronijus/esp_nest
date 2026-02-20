@@ -25,3 +25,4 @@ void ui_set_brightness(int brightness);
 void ui_set_fan_level(int level);
 
 void ui_register_change_cb(ui_change_cb_t cb);
+void ui_process_pending(void);
