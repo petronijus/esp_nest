@@ -448,7 +448,7 @@ static void rgb_panel_init(void)
     lv_init();
 
     /* PARTIAL mode: small render buffer, flush writes rotated pixels to FB */
-    static lv_color_t lvgl_buf[LCD_H_RES * 30];
+    static lv_color_t lvgl_buf[LCD_H_RES * 60];
     s_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_flush_cb(s_disp, lvgl_flush_cb);
     lv_display_set_buffers(s_disp, lvgl_buf, NULL, sizeof(lvgl_buf),

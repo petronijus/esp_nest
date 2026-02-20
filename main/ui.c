@@ -187,9 +187,6 @@ static lv_obj_t *create_dot(lv_obj_t *parent, bool filled, lv_color_t color,
     if (filled) {
         lv_obj_set_style_bg_color(dot, color, 0);
         lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-        lv_obj_set_style_shadow_color(dot, color, 0);
-        lv_obj_set_style_shadow_width(dot, 12, 0);
-        lv_obj_set_style_shadow_opa(dot, LV_OPA_70, 0);
     } else {
         lv_obj_set_style_bg_opa(dot, LV_OPA_TRANSP, 0);
     }
