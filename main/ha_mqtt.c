@@ -30,7 +30,9 @@ static const char *Z2M_LIGHT_SET     = "zigbee2mqtt/livingroom_lights/set";
 static const char *Z2M_LIGHT_GET     = "zigbee2mqtt/livingroom_lights/get";
 
 #define LIGHT_THROTTLE_MS   300
-#define ECHO_SUPPRESS_MS    800
+#define ECHO_SUPPRESS_MS    2000   /* longer window for slow Zigbee round-trips */
+#define ECHO_ACTIVE_MS      600    /* suppress ALL msgs this long after publish */
+#define ECHO_RAW_TOLERANCE  2      /* ±2 in 0-255 raw space for echo detection */
 
 static esp_mqtt_client_handle_t s_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
@@ -38,9 +40,10 @@ static bool s_connected = false;
 static char s_device_id[16] = {0};
 
 static int s_last_pub_brightness = -1;
+static int s_last_pub_raw = -1;       /* raw 0-255 value we last published */
 static int s_last_pub_fan = -1;
-static int64_t s_ignore_light_until = 0;
 static int64_t s_last_light_pub_time = 0;
+static int64_t s_last_fan_pub_time = 0;
 static bool s_light_pub_pending = false;
 static TimerHandle_t s_light_timer = NULL;
 
@@ -146,8 +149,8 @@ static void publish_light_now(void)
     esp_mqtt_client_publish(s_client, Z2M_LIGHT_SET, payload, 0, 0, 0);
 
     s_last_pub_brightness = brightness;
+    s_last_pub_raw = raw;
     s_last_light_pub_time = esp_timer_get_time() / 1000;
-    s_ignore_light_until = s_last_light_pub_time + ECHO_SUPPRESS_MS;
     s_light_pub_pending = false;
 
     ESP_LOGI(TAG, "Light publish: %s", payload);
@@ -191,6 +194,7 @@ void ha_mqtt_publish_fan(void)
     static const char *labels[] = {"Off", "low", "medium", "high"};
     esp_mqtt_client_publish(s_client, FAN_TOPIC, labels[level], 0, 0, 1);
     s_last_pub_fan = level;
+    s_last_fan_pub_time = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "Fan publish: %s", labels[level]);
 }
 
@@ -237,10 +241,19 @@ static void handle_fan_message(const char *data, int len)
     msg[n] = '\0';
 
     int new_level = ui_get_fan_level();
-    if (strcmp(msg, "Off") == 0)        new_level = 0;
-    else if (strcmp(msg, "low") == 0)   new_level = 1;
-    else if (strcmp(msg, "medium") == 0) new_level = 2;
-    else if (strcmp(msg, "high") == 0)  new_level = 3;
+    if (str_eq_icase(msg, "Off"))         new_level = 0;
+    else if (str_eq_icase(msg, "low"))    new_level = 1;
+    else if (str_eq_icase(msg, "medium")) new_level = 2;
+    else if (str_eq_icase(msg, "high"))   new_level = 3;
+
+    /* Echo suppression: if we recently published this same value, ignore */
+    int64_t now = esp_timer_get_time() / 1000;
+    if (s_last_fan_pub_time > 0
+        && now - s_last_fan_pub_time < 1000
+        && new_level == s_last_pub_fan) {
+        ESP_LOGD(TAG, "Suppressing fan echo (%s)", msg);
+        return;
+    }
 
     if (new_level != ui_get_fan_level()) {
         s_last_pub_fan = new_level;
@@ -251,12 +264,6 @@ static void handle_fan_message(const char *data, int len)
 
 static void handle_light_message(const char *data, int len)
 {
-    int64_t now = esp_timer_get_time() / 1000;
-    if (now < s_ignore_light_until || s_light_pub_pending) {
-        ESP_LOGD(TAG, "Ignoring light echo");
-        return;
-    }
-
     char msg[256] = {0};
     int n = len < (int)sizeof(msg) - 1 ? len : (int)sizeof(msg) - 1;
     memcpy(msg, data, n);
@@ -266,6 +273,43 @@ static void handle_light_message(const char *data, int len)
     int br = -1;
     bool have_state = parse_json_string(msg, "state", state_str, sizeof(state_str));
     bool have_br = parse_json_int(msg, "brightness", &br);
+
+    /* --- Two-phase echo suppression ---
+     *
+     * Phase 1 (active period, 0..ECHO_ACTIVE_MS after publish):
+     *   User may still be rotating the encoder.  Suppress ALL incoming
+     *   messages to prevent flicker from stale echoes.
+     *
+     * Phase 2 (echo tail, ECHO_ACTIVE_MS..ECHO_SUPPRESS_MS):
+     *   Compare the incoming raw brightness to what we published.
+     *   Suppress if it matches (within tolerance) — it's our own echo.
+     *   Let through messages with a different value — those are external
+     *   commands from Home Assistant / other controllers.
+     */
+    int64_t now = esp_timer_get_time() / 1000;
+    int64_t since_pub = now - s_last_light_pub_time;
+
+    if (s_light_pub_pending) {
+        ESP_LOGD(TAG, "Ignoring light msg (publish pending)");
+        return;
+    }
+
+    if (s_last_light_pub_time > 0 && since_pub < ECHO_ACTIVE_MS) {
+        ESP_LOGD(TAG, "Ignoring light msg (active period, %lld ms)",
+                 (long long)since_pub);
+        return;
+    }
+
+    if (s_last_light_pub_time > 0 && since_pub < ECHO_SUPPRESS_MS
+        && s_last_pub_raw >= 0 && have_br) {
+        if (br >= 0 && abs(br - s_last_pub_raw) <= ECHO_RAW_TOLERANCE) {
+            ESP_LOGD(TAG, "Suppressing light echo (raw=%d≈pub %d, %lld ms)",
+                     br, s_last_pub_raw, (long long)since_pub);
+            return;
+        }
+    }
+
+    /* --- Process the message --- */
 
     int new_level = ui_get_brightness();
 
@@ -280,6 +324,21 @@ static void handle_light_message(const char *data, int len)
             new_level = 0;
         } else if (str_eq_icase(state_str, "ON") && !have_br && new_level == 0) {
             new_level = 100;
+        }
+    }
+
+    /* Rounding guard: if the incoming raw brightness converts back to
+     * the same raw we published (or within ±1), the 0-100% values may
+     * differ by 1 due to integer math.  Suppress such phantom changes
+     * to prevent slow oscillation (e.g. 50%→128→127→49%→128→…). */
+    if (new_level != ui_get_brightness()
+        && s_last_pub_raw >= 0 && have_br && br >= 0) {
+        int our_raw = (ui_get_brightness() * 255 + 50) / 100;
+        if (abs(br - our_raw) <= ECHO_RAW_TOLERANCE) {
+            ESP_LOGD(TAG, "Suppressing rounding artifact "
+                     "(mqtt %d%% raw=%d, ui %d%% raw=%d)",
+                     new_level, br, ui_get_brightness(), our_raw);
+            return;
         }
     }
 
@@ -534,7 +593,10 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         request_current_state();
         publish_device_state();
         s_last_pub_brightness = -1;
+        s_last_pub_raw = -1;
         s_last_pub_fan = -1;
+        s_last_light_pub_time = 0;
+        s_last_fan_pub_time = 0;
         break;
 
     case MQTT_EVENT_DISCONNECTED:

@@ -67,6 +67,7 @@ static int s_fan_accum = 0;
 
 /* Single screen with page containers */
 static lv_obj_t *s_screen = NULL;
+static lv_obj_t *s_glow[SCREEN_COUNT];
 static lv_obj_t *s_pages[SCREEN_COUNT];
 static int s_current = 0;
 static bool s_animating = false;
@@ -107,7 +108,7 @@ static void update_arc(int center_deg, lv_color_t color)
     lv_obj_set_style_arc_color(s_arc, color, LV_PART_MAIN);
 }
 
-static void init_arc(lv_obj_t *parent)
+static void init_circle(lv_obj_t *parent)
 {
     s_menu_circle = lv_obj_create(parent);
     lv_obj_remove_style_all(s_menu_circle);
@@ -120,7 +121,10 @@ static void init_arc(lv_obj_t *parent)
     lv_obj_align(s_menu_circle, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(s_menu_circle, LV_OBJ_FLAG_FLOATING);
     lv_obj_clear_flag(s_menu_circle, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+}
 
+static void init_arc(lv_obj_t *parent)
+{
     s_arc = lv_arc_create(parent);
     lv_obj_remove_style_all(s_arc);
     lv_obj_set_size(s_arc, CIRCLE_DIAM, CIRCLE_DIAM);
@@ -237,9 +241,6 @@ static lv_obj_t *build_lights_page(lv_obj_t *parent)
 {
     lv_obj_t *page = create_page_container(parent);
 
-    /* Background glow -- yellow at top */
-    create_image(page, &bg_glow_yellow, LV_ALIGN_TOP_MID, 0, 0);
-
     create_dot(page, true, COL_YELLOW, LV_ALIGN_TOP_MID, 77);
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_BOTTOM_MID, -77);
     create_title(page, "Lights");
@@ -250,9 +251,6 @@ static lv_obj_t *build_lights_page(lv_obj_t *parent)
 static lv_obj_t *build_fan_page(lv_obj_t *parent)
 {
     lv_obj_t *page = create_page_container(parent);
-
-    /* Background glow -- teal at bottom */
-    create_image(page, &bg_glow_teal, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     create_dot(page, false, COL_CIRCLE, LV_ALIGN_TOP_MID, 77);
     create_dot(page, true, COL_TEAL, LV_ALIGN_BOTTOM_MID, -77);
@@ -442,11 +440,22 @@ static void reset_children_opa(lv_obj_t *parent)
         lv_obj_set_style_opa(lv_obj_get_child(parent, i), LV_OPA_COVER, 0);
 }
 
+static void hide_glow_for_page(lv_obj_t *page)
+{
+    for (int i = 0; i < SCREEN_COUNT; i++) {
+        if (s_pages[i] == page && s_glow[i]) {
+            lv_obj_add_flag(s_glow[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_opa(s_glow[i], LV_OPA_COVER, 0);
+        }
+    }
+}
+
 static void fade_out_done_cb(lv_anim_t *a)
 {
     if (s_fade_out_target) {
         lv_obj_add_flag(s_fade_out_target, LV_OBJ_FLAG_HIDDEN);
         reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
         s_fade_out_target = NULL;
     }
 }
@@ -484,6 +493,26 @@ static void fade_children(lv_obj_t *parent, lv_opa_t from_opa, lv_opa_t to_opa,
     }
 }
 
+static int glow_index_for_page(lv_obj_t *page)
+{
+    for (int i = 0; i < SCREEN_COUNT; i++)
+        if (s_pages[i] == page) return i;
+    return -1;
+}
+
+static void fade_glow(int idx, lv_opa_t from, lv_opa_t to, uint32_t dur_ms)
+{
+    if (idx < 0 || !s_glow[idx]) return;
+    lv_obj_set_style_opa(s_glow[idx], from, 0);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_glow[idx]);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_exec_cb(&a, fade_opa_cb);
+    lv_anim_set_duration(&a, dur_ms);
+    lv_anim_start(&a);
+}
+
 static void fade_transition(lv_obj_t *from, lv_obj_t *to)
 {
     if (s_animating) return;
@@ -491,13 +520,20 @@ static void fade_transition(lv_obj_t *from, lv_obj_t *to)
 
     s_fade_out_target = from;
 
-    /* Fade out visible children of departing page */
+    /* Fade out visible children of departing page + its glow */
     fade_children(from, LV_OPA_COVER, LV_OPA_TRANSP, FADE_TIME_MS, fade_out_done_cb);
+    fade_glow(glow_index_for_page(from), LV_OPA_COVER, LV_OPA_TRANSP, FADE_TIME_MS);
 
-    /* Show arriving page, fade in its visible children */
+    /* Show arriving page + its glow, fade in */
     lv_obj_set_style_opa(to, LV_OPA_COVER, 0);
     lv_obj_clear_flag(to, LV_OBJ_FLAG_HIDDEN);
     fade_children(to, LV_OPA_TRANSP, LV_OPA_COVER, FADE_TIME_MS, fade_in_done_cb);
+
+    int to_idx = glow_index_for_page(to);
+    if (to_idx >= 0 && s_glow[to_idx]) {
+        lv_obj_clear_flag(s_glow[to_idx], LV_OBJ_FLAG_HIDDEN);
+        fade_glow(to_idx, LV_OPA_TRANSP, LV_OPA_COVER, FADE_TIME_MS);
+    }
 }
 
 /* ========================================================================== */
@@ -518,6 +554,7 @@ static void enter_bright_done_cb(lv_anim_t *a)
     if (s_fade_out_target) {
         lv_obj_add_flag(s_fade_out_target, LV_OBJ_FLAG_HIDDEN);
         reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
         s_fade_out_target = NULL;
     }
     s_animating = false;
@@ -601,8 +638,9 @@ static void enter_brightness_mode(void)
 
     s_fade_out_target = s_pages[s_current];
 
-    /* Anim 1: Fade out menu page children */
+    /* Anim 1: Fade out menu page children + glow */
     fade_children(s_pages[s_current], LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_glow(glow_index_for_page(s_pages[s_current]), LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS);
 
     /* Anim 2: Grow outer circle outline 308 -> 456 */
     lv_anim_t a2;
@@ -658,10 +696,17 @@ static void exit_brightness_mode(void)
         ? BRIGHT_CIRCLE_MIN + (BRIGHT_CIRCLE_MAX - BRIGHT_CIRCLE_MIN) * s_brightness / 100
         : 1;
 
-    /* Show lights page underneath, fade in its children */
+    /* Show lights page underneath + its glow, fade in */
     lv_obj_set_style_opa(s_pages[s_current], LV_OPA_COVER, 0);
     lv_obj_clear_flag(s_pages[s_current], LV_OBJ_FLAG_HIDDEN);
     fade_children(s_pages[s_current], LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    {
+        int gi = glow_index_for_page(s_pages[s_current]);
+        if (gi >= 0 && s_glow[gi]) {
+            lv_obj_clear_flag(s_glow[gi], LV_OBJ_FLAG_HIDDEN);
+            fade_glow(gi, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS);
+        }
+    }
 
     /* Anim 2: Shrink outer circle 456 -> 308 */
     lv_anim_t a2;
@@ -719,6 +764,7 @@ static void enter_fan_done_cb(lv_anim_t *a)
     if (s_fade_out_target) {
         lv_obj_add_flag(s_fade_out_target, LV_OBJ_FLAG_HIDDEN);
         reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
         s_fade_out_target = NULL;
     }
     s_animating = false;
@@ -763,8 +809,9 @@ static void enter_fan_mode(void)
 
     s_fade_out_target = s_pages[s_current];
 
-    /* Fade out menu page children */
+    /* Fade out menu page children + glow */
     fade_children(s_pages[s_current], LV_OPA_COVER, LV_OPA_TRANSP, FAN_ANIM_MS, NULL);
+    fade_glow(glow_index_for_page(s_pages[s_current]), LV_OPA_COVER, LV_OPA_TRANSP, FAN_ANIM_MS);
 
     /* Grow all 3 circles from start to final size */
     for (int i = 0; i < 3; i++) {
@@ -806,10 +853,17 @@ static void exit_fan_mode(void)
     s_mode = UI_MODE_MENU;
     s_animating = true;
 
-    /* Show menu page underneath, fade in its children */
+    /* Show menu page underneath + its glow, fade in */
     lv_obj_set_style_opa(s_pages[s_current], LV_OPA_COVER, 0);
     lv_obj_clear_flag(s_pages[s_current], LV_OBJ_FLAG_HIDDEN);
     fade_children(s_pages[s_current], LV_OPA_TRANSP, LV_OPA_COVER, FAN_ANIM_MS, NULL);
+    {
+        int gi = glow_index_for_page(s_pages[s_current]);
+        if (gi >= 0 && s_glow[gi]) {
+            lv_obj_clear_flag(s_glow[gi], LV_OBJ_FLAG_HIDDEN);
+            fade_glow(gi, LV_OPA_TRANSP, LV_OPA_COVER, FAN_ANIM_MS);
+        }
+    }
 
     /* Shrink all 3 circles back to start sizes */
     for (int i = 0; i < 3; i++) {
@@ -859,7 +913,14 @@ void ui_init(void)
     lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_screen, LV_SCROLLBAR_MODE_OFF);
 
-    /* Build menu pages */
+    /* Glow images (furthest back in z-order) */
+    s_glow[0] = create_image(s_screen, &bg_glow_yellow, LV_ALIGN_TOP_MID, 0, 0);
+    s_glow[1] = create_image(s_screen, &bg_glow_teal, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    /* Circle outline (behind pages so titles render in front) */
+    init_circle(s_screen);
+
+    /* Build menu pages (dots + titles, no glow) */
     s_pages[0] = build_lights_page(s_screen);
     s_pages[1] = build_fan_page(s_screen);
 
@@ -876,10 +937,13 @@ void ui_init(void)
     lv_obj_set_style_opa(s_fan_page, LV_OPA_TRANSP, 0);
     lv_obj_add_flag(s_fan_page, LV_OBJ_FLAG_HIDDEN);
 
-    /* Start with page 0 visible, page 1 hidden */
+    /* Start with page 0 visible, page 1 hidden (glows follow their page) */
     lv_obj_set_style_opa(s_pages[0], LV_OPA_COVER, 0);
     lv_obj_set_style_opa(s_pages[1], LV_OPA_TRANSP, 0);
     lv_obj_add_flag(s_pages[1], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(s_glow[0], LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_glow[1], LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(s_glow[1], LV_OBJ_FLAG_HIDDEN);
 
     /* Status label (on the screen itself, above everything) */
     s_status_label = lv_label_create(s_screen);
