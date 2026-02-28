@@ -50,6 +50,8 @@ static ui_change_cb_t s_change_cb = NULL;
 
 static volatile int s_pending_brightness = -1;
 static volatile int s_pending_fan = -1;
+static char s_pending_status[128] = {0};
+static volatile bool s_status_dirty = false;
 
 #define DETAIL_IDLE_TIMEOUT_MS 60000
 static uint32_t s_detail_last_activity = 0;
@@ -898,9 +900,9 @@ void ui_init(void)
 
 void ui_set_status(const char *text)
 {
-    if (s_status_label) {
-        lv_label_set_text(s_status_label, text);
-    }
+    strncpy(s_pending_status, text, sizeof(s_pending_status) - 1);
+    s_pending_status[sizeof(s_pending_status) - 1] = '\0';
+    s_status_dirty = true;
 }
 
 void ui_encoder_navigate(int diff)
@@ -1030,6 +1032,12 @@ void ui_process_pending(void)
             s_fan_level = fan;
             if (s_mode == UI_MODE_FAN) update_fan_display();
         }
+    }
+
+    if (s_status_dirty) {
+        s_status_dirty = false;
+        if (s_status_label)
+            lv_label_set_text(s_status_label, s_pending_status);
     }
 
     if (s_mode != UI_MODE_MENU && !s_animating) {

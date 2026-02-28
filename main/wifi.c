@@ -13,14 +13,17 @@ static const char *TAG = "wifi";
 
 #define WIFI_SSID       CONFIG_WIFI_SSID
 #define WIFI_PASS       CONFIG_WIFI_PASSWORD
-#define WIFI_MAX_RETRY  CONFIG_WIFI_MAX_RETRY
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 
+#define INITIAL_MAX_RETRY   10
+#define RECONNECT_DELAY_MS  5000
+
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static bool s_connected = false;
+static bool s_initial_connect_done = false;
 static char s_ip_str[16] = "0.0.0.0";
 
 static void event_handler(void *arg, esp_event_base_t event_base,
@@ -30,29 +33,50 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "Disconnected, reason: %d", disconn->reason);
+        ESP_LOGW(TAG, "Disconnected (reason %d)", disconn->reason);
         s_connected = false;
-        if (s_retry_num < WIFI_MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retrying connection (%d/%d)...", s_retry_num, WIFI_MAX_RETRY);
+
+        if (!s_initial_connect_done) {
+            if (s_retry_num < INITIAL_MAX_RETRY) {
+                s_retry_num++;
+                ESP_LOGI(TAG, "Initial connect retry %d/%d...",
+                         s_retry_num, INITIAL_MAX_RETRY);
+                esp_wifi_connect();
+            } else {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+                ESP_LOGW(TAG, "Initial connection failed after %d retries",
+                         INITIAL_MAX_RETRY);
+            }
         } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGW(TAG, "Connection failed after %d retries", WIFI_MAX_RETRY);
+            s_retry_num++;
+            int delay = RECONNECT_DELAY_MS;
+            if (s_retry_num > 30) delay = 30000;
+            else if (s_retry_num > 10) delay = 10000;
+            ESP_LOGI(TAG, "Reconnecting (attempt %d, backoff %dms)...",
+                     s_retry_num, delay);
+            vTaskDelay(pdMS_TO_TICKS(delay));
+            esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "Connected! IP: %s", s_ip_str);
+
+        if (s_retry_num > 0) {
+            ESP_LOGI(TAG, "Reconnected after %d retries. IP: %s",
+                     s_retry_num, s_ip_str);
+        } else {
+            ESP_LOGI(TAG, "Connected. IP: %s", s_ip_str);
+        }
+
         s_retry_num = 0;
         s_connected = true;
+        s_initial_connect_done = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
 esp_err_t wifi_init_sta(void)
 {
-    /* Initialize NVS — required by WiFi driver */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -99,9 +123,13 @@ esp_err_t wifi_init_sta(void)
         return ESP_OK;
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGE(TAG, "Failed to connect to %s", WIFI_SSID);
+        s_initial_connect_done = true;
+        esp_wifi_connect();
         return ESP_FAIL;
     } else {
         ESP_LOGE(TAG, "Connection timed out");
+        s_initial_connect_done = true;
+        esp_wifi_connect();
         return ESP_FAIL;
     }
 }

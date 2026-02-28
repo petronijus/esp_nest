@@ -55,13 +55,51 @@ static void lvgl_task(void *arg)
     }
 }
 
-static void mqtt_telemetry_task(void *arg)
+static void update_status_line(void)
 {
+    char buf[128];
+    bool wifi = wifi_is_connected();
+    bool mqtt = ha_mqtt_is_connected();
+
+    if (!wifi) {
+        snprintf(buf, sizeof(buf), "WiFi: disconnected");
+    } else if (!mqtt) {
+        snprintf(buf, sizeof(buf), "IP: %s | MQTT: offline", wifi_get_ip_str());
+    } else {
+        snprintf(buf, sizeof(buf), "IP: %s | MQTT: ok", wifi_get_ip_str());
+    }
+    ui_set_status(buf);
+}
+
+static void monitor_task(void *arg)
+{
+    bool was_wifi = false;
+    bool was_mqtt = false;
+
     for (;;) {
-        if (ha_mqtt_is_connected()) {
+        bool wifi_now = wifi_is_connected();
+        bool mqtt_now = ha_mqtt_is_connected();
+
+        if (wifi_now != was_wifi || mqtt_now != was_mqtt) {
+            update_status_line();
+            was_wifi = wifi_now;
+            was_mqtt = mqtt_now;
+
+            if (wifi_now && !was_wifi)
+                ESP_LOGI(TAG, "WiFi restored");
+            if (!wifi_now && was_wifi)
+                ESP_LOGW(TAG, "WiFi lost");
+            if (mqtt_now && !was_mqtt)
+                ESP_LOGI(TAG, "MQTT restored");
+            if (!mqtt_now && was_mqtt)
+                ESP_LOGW(TAG, "MQTT lost");
+        }
+
+        if (mqtt_now) {
             ha_mqtt_publish_state();
         }
-        vTaskDelay(pdMS_TO_TICKS(30000));
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
@@ -79,40 +117,30 @@ void app_main(void)
 
     esp_err_t wifi_ret = wifi_init_sta();
     if (wifi_ret != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi connection failed");
-        ui_set_status("WiFi Failed!");
-        return;
+        ESP_LOGW(TAG, "WiFi initial connection failed, will keep retrying");
+        ui_set_status("WiFi: connecting...");
+    } else {
+        ESP_LOGI(TAG, "WiFi ready: %s", wifi_get_ip_str());
+        ui_set_status("WiFi connected, starting services...");
     }
 
-    ESP_LOGI(TAG, "WiFi ready: %s", wifi_get_ip_str());
-    char buf[128];
-    snprintf(buf, sizeof(buf), "IP: %s\nConnecting MQTT...", wifi_get_ip_str());
-    ui_set_status(buf);
-
-    /* --- OTA Server --- */
-    ESP_LOGI(TAG, "Starting OTA server...");
-    ota_server_start();
+    /* --- OTA Server (start even without WiFi, will work once connected) --- */
+    if (wifi_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Starting OTA server...");
+        ota_server_start();
+    }
 
     /* --- MQTT --- */
-    ESP_LOGI(TAG, "Connecting MQTT...");
-    esp_err_t mqtt_ret = ha_mqtt_init();
-
-    if (mqtt_ret == ESP_OK) {
-        snprintf(buf, sizeof(buf), "IP: %s\nMQTT: OK\nOTA: http://%s/",
-                 wifi_get_ip_str(), wifi_get_ip_str());
-        ESP_LOGI(TAG, "MQTT connected");
-    } else {
-        snprintf(buf, sizeof(buf), "IP: %s\nMQTT: Fail\nOTA: http://%s/",
-                 wifi_get_ip_str(), wifi_get_ip_str());
-        ESP_LOGW(TAG, "MQTT connection failed");
-    }
-    ui_set_status(buf);
-    ha_mqtt_publish_state();
+    ESP_LOGI(TAG, "Initializing MQTT...");
+    ha_mqtt_init();
 
     /* LED ring breathing animation */
     led_ring_start();
 
-    /* Periodic telemetry */
-    xTaskCreate(mqtt_telemetry_task, "telemetry", 4096, NULL, 3, NULL);
+    /* Update status display with current state */
+    update_status_line();
+
+    /* Periodic monitoring & telemetry */
+    xTaskCreate(monitor_task, "monitor", 4096, NULL, 3, NULL);
     ESP_LOGI(TAG, "All services started");
 }
