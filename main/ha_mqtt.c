@@ -7,7 +7,6 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
@@ -45,7 +44,6 @@ static int s_last_pub_fan = -1;
 static int64_t s_last_light_pub_time = 0;
 static int64_t s_last_fan_pub_time = 0;
 static bool s_light_pub_pending = false;
-static TimerHandle_t s_light_timer = NULL;
 
 static void build_device_id(void)
 {
@@ -156,13 +154,6 @@ static void publish_light_now(void)
     ESP_LOGI(TAG, "Light publish: %s", payload);
 }
 
-static void light_timer_cb(TimerHandle_t t)
-{
-    if (s_light_pub_pending) {
-        publish_light_now();
-    }
-}
-
 void ha_mqtt_publish_light(void)
 {
     if (!s_connected) return;
@@ -177,11 +168,6 @@ void ha_mqtt_publish_light(void)
         publish_light_now();
     } else {
         s_light_pub_pending = true;
-        if (s_light_timer) {
-            xTimerChangePeriod(s_light_timer,
-                pdMS_TO_TICKS(LIGHT_THROTTLE_MS), 0);
-            xTimerStart(s_light_timer, 0);
-        }
     }
 }
 
@@ -656,9 +642,6 @@ esp_err_t ha_mqtt_init(void)
     build_topics();
     s_mqtt_event_group = xEventGroupCreate();
 
-    s_light_timer = xTimerCreate("light_pub", pdMS_TO_TICKS(LIGHT_THROTTLE_MS),
-                                  pdFALSE, NULL, light_timer_cb);
-
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = CONFIG_MQTT_BROKER_URI,
         .credentials.username = CONFIG_MQTT_USERNAME,
@@ -684,6 +667,15 @@ esp_err_t ha_mqtt_init(void)
         MQTT_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
 
     return (bits & MQTT_CONNECTED_BIT) ? ESP_OK : ESP_FAIL;
+}
+
+void ha_mqtt_process_pending(void)
+{
+    if (!s_light_pub_pending) return;
+    int64_t now = esp_timer_get_time() / 1000;
+    if (now - s_last_light_pub_time >= LIGHT_THROTTLE_MS) {
+        publish_light_now();
+    }
 }
 
 void ha_mqtt_publish_state(void)

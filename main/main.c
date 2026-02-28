@@ -47,6 +47,7 @@ static void lvgl_task(void *arg)
     ESP_LOGI(TAG, "Entering LVGL main loop");
     for (;;) {
         ui_process_pending();
+        ha_mqtt_process_pending();
         uint32_t time_till_next = lv_timer_handler();
         if (time_till_next < 1) {
             time_till_next = 1;
