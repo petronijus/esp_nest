@@ -63,6 +63,7 @@ static void notify_change(ui_event_type_t type, int value)
 
 /* Fan detail state: 0=off, 1=low, 2=medium, 3=high */
 static int s_fan_level = 0;
+static int s_last_nonzero_fan = 1;   /* default "low" when no last mode known */
 static int s_fan_accum = 0;
 
 /* Single screen with page containers */
@@ -320,7 +321,7 @@ static lv_obj_t *build_brightness_page(lv_obj_t *parent)
 
     /* Hint text */
     s_bright_hint = lv_label_create(page);
-    lv_label_set_text(s_bright_hint, "long press to turn off");
+    lv_label_set_text(s_bright_hint, "long press to toggle");
     lv_obj_set_style_text_color(s_bright_hint, COL_WHITE, 0);
     lv_obj_set_style_text_font(s_bright_hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_letter_space(s_bright_hint, 3, 0);
@@ -397,7 +398,7 @@ static lv_obj_t *build_fan_detail_page(lv_obj_t *parent)
     lv_obj_clear_flag(s_fan_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     s_fan_hint = lv_label_create(page);
-    lv_label_set_text(s_fan_hint, "long press to turn off");
+    lv_label_set_text(s_fan_hint, "long press to toggle");
     lv_obj_set_style_text_color(s_fan_hint, COL_WHITE, 0);
     lv_obj_set_style_text_font(s_fan_hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_letter_space(s_fan_hint, 3, 0);
@@ -989,12 +990,14 @@ void ui_encoder_navigate(int diff)
             s_fan_level++;
             if (s_fan_level > 3) s_fan_level = 3;
             s_fan_accum = 0;
+            if (s_fan_level > 0) s_last_nonzero_fan = s_fan_level;
             update_fan_display();
             notify_change(UI_EVT_FAN, s_fan_level);
         } else if (s_fan_accum <= -3) {
             s_fan_level--;
             if (s_fan_level < 0) s_fan_level = 0;
             s_fan_accum = 0;
+            if (s_fan_level > 0) s_last_nonzero_fan = s_fan_level;
             update_fan_display();
             notify_change(UI_EVT_FAN, s_fan_level);
         }
@@ -1022,23 +1025,43 @@ void ui_encoder_press(void)
     }
 }
 
+static void toggle_light(void)
+{
+    if (s_brightness == 0) {
+        s_brightness = s_last_nonzero_brightness > 0 ? s_last_nonzero_brightness : 100;
+    } else {
+        s_brightness = 0;
+    }
+    update_brightness_display();
+    notify_change(UI_EVT_BRIGHTNESS, s_brightness);
+    ESP_LOGI(TAG, "Long press: light toggled to %d%%", s_brightness);
+}
+
+static void toggle_fan(void)
+{
+    if (s_fan_level == 0) {
+        s_fan_level = s_last_nonzero_fan;
+    } else {
+        s_last_nonzero_fan = s_fan_level;
+        s_fan_level = 0;
+    }
+    update_fan_display();
+    notify_change(UI_EVT_FAN, s_fan_level);
+    ESP_LOGI(TAG, "Long press: fan toggled to %s", fan_level_names[s_fan_level]);
+}
+
 void ui_encoder_long_press(void)
 {
-    if (s_mode == UI_MODE_BRIGHTNESS) {
-        if (s_brightness == 0) {
-            s_brightness = s_last_nonzero_brightness > 0 ? s_last_nonzero_brightness : 100;
-        } else {
-            s_brightness = 0;
-        }
-        update_brightness_display();
-        notify_change(UI_EVT_BRIGHTNESS, s_brightness);
-        ESP_LOGI(TAG, "Long press: brightness toggled to %d", s_brightness);
+    if (s_mode == UI_MODE_MENU) {
+        /* Toggle the entity of the currently shown menu page without
+         * entering its detail screen. */
+        if (s_current == 0) toggle_light();
+        else               toggle_fan();
+    } else if (s_mode == UI_MODE_BRIGHTNESS) {
+        toggle_light();
         exit_brightness_mode();
     } else if (s_mode == UI_MODE_FAN) {
-        s_fan_level = 0;
-        update_fan_display();
-        notify_change(UI_EVT_FAN, s_fan_level);
-        ESP_LOGI(TAG, "Long press: fan set to off");
+        toggle_fan();
         exit_fan_mode();
     }
 }
@@ -1094,6 +1117,7 @@ void ui_process_pending(void)
         s_pending_fan = -1;
         if (fan != s_fan_level) {
             s_fan_level = fan;
+            if (s_fan_level > 0) s_last_nonzero_fan = s_fan_level;
             if (s_mode == UI_MODE_FAN) update_fan_display();
         }
     }
