@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
+#include "led_ring.h"
 
 static const char *TAG = "ui";
 
@@ -109,6 +110,7 @@ static ui_change_cb_t s_change_cb = NULL;
 
 static volatile int s_pending_brightness = -1;
 static volatile int s_pending_fan = -1;
+static volatile int s_pending_blinds[2] = {-1, -1};
 static char s_pending_status[128] = {0};
 static volatile bool s_status_dirty = false;
 
@@ -644,6 +646,7 @@ static void blinds_move(int dir)
     if (next == *pos) return;
     *pos = next;
     blinds_show_pos(true);
+    notify_change(UI_EVT_BLINDS, (s_blinds_sel << 8) | next);
     ESP_LOGI(TAG, "Blinds %s -> %d/%d",
              s_blinds_sel == 0 ? "Klavir" : "DJ", next, BLINDS_POS_MAX);
 }
@@ -1625,8 +1628,7 @@ void ui_encoder_navigate(int diff)
 {
     if (diff == 0) return;
 
-    if (s_mode != UI_MODE_MENU)
-        s_detail_last_activity = lv_tick_get();
+    s_detail_last_activity = lv_tick_get();
 
     if (s_mode == UI_MODE_BRIGHTNESS) {
         s_brightness -= diff * 2;
@@ -1683,8 +1685,7 @@ void ui_encoder_navigate(int diff)
 
 void ui_encoder_press(void)
 {
-    if (s_mode != UI_MODE_MENU)
-        s_detail_last_activity = lv_tick_get();
+    s_detail_last_activity = lv_tick_get();
 
     if (s_mode == UI_MODE_MENU) {
         if (s_current == 0) {
@@ -1736,11 +1737,20 @@ static void toggle_fan(void)
 
 void ui_encoder_long_press(void)
 {
+    s_detail_last_activity = lv_tick_get();
+
     if (s_mode == UI_MODE_MENU) {
         /* Toggle the entity of the currently shown menu page without
-         * entering its detail screen (Blinds/Sound have no entity yet). */
-        if (s_current == 0)      toggle_light();
-        else if (s_current == 1) toggle_fan();
+         * entering its detail screen (Blinds/Sound have no entity yet).
+         * The LED ring flashes as feedback: there is no on-screen change
+         * in the menu, so this is the only confirmation. */
+        if (s_current == 0) {
+            toggle_light();
+            led_ring_feedback(s_brightness > 0);
+        } else if (s_current == 1) {
+            toggle_fan();
+            led_ring_feedback(s_fan_level > 0);
+        }
     } else if (s_mode == UI_MODE_BRIGHTNESS) {
         toggle_light();
         exit_brightness_mode();
@@ -1787,6 +1797,14 @@ void ui_set_fan_level(int level)
     s_pending_fan = level;
 }
 
+void ui_set_blinds_pos(int target, int step)
+{
+    if (target < 0 || target > 1) return;
+    if (step < 0) step = 0;
+    if (step > BLINDS_POS_MAX) step = BLINDS_POS_MAX;
+    s_pending_blinds[target] = step;
+}
+
 void ui_process_pending(void)
 {
     int br = s_pending_brightness;
@@ -1809,15 +1827,26 @@ void ui_process_pending(void)
         }
     }
 
+    for (int t = 0; t < 2; t++) {
+        int step = s_pending_blinds[t];
+        if (step >= 0) {
+            s_pending_blinds[t] = -1;
+            if (step != s_blinds_pos[t]) {
+                s_blinds_pos[t] = step;
+                if (s_mode == UI_MODE_BLINDS && s_blinds_sel == t)
+                    blinds_show_pos(true);
+            }
+        }
+    }
+
     if (s_status_dirty) {
         s_status_dirty = false;
         if (s_status_label)
             lv_label_set_text(s_status_label, s_pending_status);
     }
 
-    if (s_mode != UI_MODE_MENU && !s_animating) {
-        uint32_t elapsed = lv_tick_elaps(s_detail_last_activity);
-        if (elapsed >= DETAIL_IDLE_TIMEOUT_MS) {
+    if (!s_animating && lv_tick_elaps(s_detail_last_activity) >= DETAIL_IDLE_TIMEOUT_MS) {
+        if (s_mode != UI_MODE_MENU) {
             ESP_LOGI(TAG, "Detail screen idle timeout, returning to menu");
             if (s_mode == UI_MODE_BRIGHTNESS)
                 exit_brightness_mode();
@@ -1827,6 +1856,11 @@ void ui_process_pending(void)
                 exit_sound_mode();
             else if (s_mode == UI_MODE_BLINDS)
                 exit_blinds_mode();
+            /* once the exit animation finishes, the branch below brings
+             * the menu back to the default Lights page */
+        } else if (s_current != 0) {
+            ESP_LOGI(TAG, "Menu idle timeout, returning to Lights");
+            switch_page(0, s_current >= 2 ? 1 : -1);
         }
     }
 }

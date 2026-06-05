@@ -18,12 +18,47 @@ static const char *TAG = "led_ring";
 static led_strip_handle_t s_strip = NULL;
 static volatile bool s_led_enabled = true;
 
+/* Feedback effect state: a request counter (incremented by the UI task)
+ * and the on/off flavor; the LED task latches the counter change. */
+#define FX_DURATION_MS  600
+static volatile uint32_t s_fx_req = 0;
+static volatile bool s_fx_turned_on = false;
+
+void led_ring_feedback(bool turned_on)
+{
+    s_fx_turned_on = turned_on;
+    s_fx_req++;
+}
+
+/* Brightness envelope 0..1 for the feedback effect at time t (ms) */
+static float fx_level(bool turned_on, uint32_t t)
+{
+    if (turned_on) {
+        /* single bright swell: half sine over the duration */
+        return sinf((float)t / FX_DURATION_MS * (float)M_PI);
+    }
+    /* turned off: two crisp blinks */
+    if (t < 150)  return 0.8f;
+    if (t < 300)  return 0.0f;
+    if (t < 450)  return 0.8f;
+    return 0.0f;
+}
+
 static void led_ring_task(void *arg)
 {
     uint32_t tick = 0;
+    uint32_t fx_seen = 0;
+    uint32_t fx_elapsed = FX_DURATION_MS;   /* inactive */
+    bool fx_on = false;
 
     for (;;) {
         uint8_t r = 0, g = 0, b = 0;
+
+        if (fx_seen != s_fx_req) {          /* new feedback request */
+            fx_seen = s_fx_req;
+            fx_on = s_fx_turned_on;
+            fx_elapsed = 0;
+        }
 
         if (!s_led_enabled) {
             for (int i = 0; i < NUM_LEDS; i++)
@@ -46,7 +81,14 @@ static void led_ring_task(void *arg)
         if (page < 0 || page > 3) page = 0;
         const uint8_t *c = page_rgb[page];
 
-        if (page == 0 && ui_is_detail_mode()) {
+        if (fx_elapsed < FX_DURATION_MS) {
+            /* Feedback effect overrides the regular animation */
+            float level = fx_level(fx_on, fx_elapsed);
+            r = (uint8_t)(c[0] * level);
+            g = (uint8_t)(c[1] * level);
+            b = (uint8_t)(c[2] * level);
+            fx_elapsed += TICK_MS;
+        } else if (page == 0 && ui_is_detail_mode()) {
             /* Brightness detail: intensity tracks brightness value directly */
             float level = (float)ui_get_brightness() / 100.0f;
             r = (uint8_t)(c[0] * level);

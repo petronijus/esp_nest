@@ -30,6 +30,38 @@ static const char *Z2M_LIGHT_SET     = "zigbee2mqtt/livingroom_lights/set";
 static const char *Z2M_LIGHT_GET     = "zigbee2mqtt/livingroom_lights/get";
 static const char *STEREO_VOL_SET    = "bashouse/stereo/volume/set";
 
+/* RF blinds: ESPHome "blinds-cc1101" bridge, MQTT-native (Wemos + CC1101,
+ * dead-reckoning time_based covers; see Dev/Arduino/blinds_remote_cc1101).
+ * Six member covers carry position 0-100 (0 = closed); the two group
+ * covers are broadcast-only (single RF burst, no position).  Strategy:
+ * full open/close goes through the group broadcast, intermediate steps
+ * via position/command to all three members.  Position is read back as
+ * the average of the three members.  Index: 0=Klavir 1=DJ (matches ui.c). */
+static const char *BLINDS_POS_STATE[2][3] = {
+    { "blinds-cc1101/cover/rolety_klavir_1/position/state",
+      "blinds-cc1101/cover/rolety_klavir_2/position/state",
+      "blinds-cc1101/cover/rolety_klavir_3/position/state" },
+    { "blinds-cc1101/cover/rolety_dj_1/position/state",
+      "blinds-cc1101/cover/rolety_dj_2/position/state",
+      "blinds-cc1101/cover/rolety_dj_3/position/state" },
+};
+static const char *BLINDS_POS_CMD[2][3] = {
+    { "blinds-cc1101/cover/rolety_klavir_1/position/command",
+      "blinds-cc1101/cover/rolety_klavir_2/position/command",
+      "blinds-cc1101/cover/rolety_klavir_3/position/command" },
+    { "blinds-cc1101/cover/rolety_dj_1/position/command",
+      "blinds-cc1101/cover/rolety_dj_2/position/command",
+      "blinds-cc1101/cover/rolety_dj_3/position/command" },
+};
+static const char *BLINDS_GROUP_CMD[2] = {
+    "blinds-cc1101/cover/rolety_klavir_group/command",
+    "blinds-cc1101/cover/rolety_dj_group/command",
+};
+
+#define BLINDS_POS_MAX_STEP  6
+#define BLINDS_SETTLE_MS     500    /* wait for the user to stop stepping */
+#define BLINDS_BLOCK_MS      2500   /* drop incoming echoes after a command */
+
 static esp_mqtt_client_handle_t s_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static bool s_connected = false;
@@ -41,6 +73,11 @@ static light_sync_t s_light_sync;
 
 static int s_last_pub_fan = -1;
 static int64_t s_last_fan_pub_time = 0;
+
+static int s_blinds_pending[2] = {-1, -1};
+static int64_t s_blinds_change_time[2] = {0, 0};
+static int64_t s_blinds_block_until[2] = {0, 0};
+static int s_blinds_member_pos[2][3] = {{-1, -1, -1}, {-1, -1, -1}};
 
 static void build_device_id(void)
 {
@@ -159,6 +196,93 @@ void ha_mqtt_publish_fan(void)
     s_last_pub_fan = level;
     s_last_fan_pub_time = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "Fan publish: %s", labels[level]);
+}
+
+/* 0-6 UI step <-> 0-100 HA cover position (100 = open, step 0) */
+static int blinds_step_to_pos(int step)
+{
+    return 100 - (step * 100 + BLINDS_POS_MAX_STEP / 2) / BLINDS_POS_MAX_STEP;
+}
+
+static int blinds_pos_to_step(int pos)
+{
+    if (pos < 0) pos = 0;
+    if (pos > 100) pos = 100;
+    return ((100 - pos) * BLINDS_POS_MAX_STEP + 50) / 100;
+}
+
+void ha_mqtt_publish_blinds(int target, int step)
+{
+    if (target < 0 || target > 1) return;
+    int64_t now = esp_timer_get_time() / 1000;
+    /* Debounced: queue the newest step, flush from process_pending once
+     * the user stops stepping (the RF link dislikes command bursts). */
+    s_blinds_pending[target] = step;
+    s_blinds_change_time[target] = now;
+    s_blinds_block_until[target] = now + BLINDS_BLOCK_MS;
+}
+
+static void blinds_flush_pending(int64_t now)
+{
+    for (int t = 0; t < 2; t++) {
+        if (s_blinds_pending[t] < 0) continue;
+        if (now - s_blinds_change_time[t] < BLINDS_SETTLE_MS) continue;
+
+        int step = s_blinds_pending[t];
+        if (step == 0 || step == BLINDS_POS_MAX_STEP) {
+            /* Endpoints: one broadcast RF burst moves all three motors,
+             * and the end-stops re-home the dead reckoning. */
+            const char *cmd = (step == 0) ? "OPEN" : "CLOSE";
+            esp_mqtt_client_publish(s_client, BLINDS_GROUP_CMD[t], cmd, 0, 0, 0);
+            ESP_LOGI(TAG, "Blinds publish: %s = %s", BLINDS_GROUP_CMD[t], cmd);
+        } else {
+            char payload[8];
+            snprintf(payload, sizeof(payload), "%d", blinds_step_to_pos(step));
+            for (int m = 0; m < 3; m++)
+                esp_mqtt_client_publish(s_client, BLINDS_POS_CMD[t][m],
+                                        payload, 0, 0, 0);
+            ESP_LOGI(TAG, "Blinds publish: %s x3 = %s",
+                     t == 0 ? "klavir" : "dj", payload);
+        }
+        s_blinds_pending[t] = -1;
+        s_blinds_block_until[t] = now + BLINDS_BLOCK_MS;
+    }
+}
+
+static void handle_blinds_position(int target, int member,
+                                   const char *data, int len)
+{
+    char msg[16] = {0};
+    int n = len < (int)sizeof(msg) - 1 ? len : (int)sizeof(msg) - 1;
+    memcpy(msg, data, n);
+    msg[n] = '\0';
+
+    char *endp = NULL;
+    long pos = strtol(msg, &endp, 10);
+    if (endp == msg) return;
+    s_blinds_member_pos[target][member] = (int)pos;
+
+    int64_t now = esp_timer_get_time() / 1000;
+    if (now < s_blinds_block_until[target] || s_blinds_pending[target] >= 0) {
+        ESP_LOGD(TAG, "Blinds msg ignored (authority window)");
+        return;
+    }
+
+    /* Average over the members we have heard from (retained messages
+     * mean all three are usually known right after connecting). */
+    int sum = 0, cnt = 0;
+    for (int m = 0; m < 3; m++) {
+        if (s_blinds_member_pos[target][m] >= 0) {
+            sum += s_blinds_member_pos[target][m];
+            cnt++;
+        }
+    }
+    if (!cnt) return;
+
+    int step = blinds_pos_to_step(sum / cnt);
+    ui_set_blinds_pos(target, step);
+    ESP_LOGI(TAG, "Blinds %s position from MQTT: avg %d%% (step %d)",
+             target == 0 ? "Klavir" : "DJ", sum / cnt, step);
 }
 
 void ha_mqtt_publish_volume(int dir)
@@ -476,6 +600,9 @@ static void subscribe_all(void)
 {
     esp_mqtt_client_subscribe(s_client, FAN_TOPIC, 1);
     esp_mqtt_client_subscribe(s_client, Z2M_LIGHT_TOPIC, 1);
+    for (int t = 0; t < 2; t++)
+        for (int m = 0; m < 3; m++)
+            esp_mqtt_client_subscribe(s_client, BLINDS_POS_STATE[t][m], 1);
     esp_mqtt_client_subscribe(s_client, "homeassistant/status", 1);
 
     char topic[128];
@@ -528,6 +655,11 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
             handle_fan_message(event->data, event->data_len);
         } else if (strcmp(topic_buf, Z2M_LIGHT_TOPIC) == 0) {
             handle_light_message(event->data, event->data_len);
+        } else if (strncmp(topic_buf, "blinds-cc1101/", 14) == 0) {
+            for (int t = 0; t < 2; t++)
+                for (int m = 0; m < 3; m++)
+                    if (strcmp(topic_buf, BLINDS_POS_STATE[t][m]) == 0)
+                        handle_blinds_position(t, m, event->data, event->data_len);
         } else if (strcmp(topic_buf, "homeassistant/status") == 0) {
             char status[16] = {0};
             int slen = event->data_len < (int)sizeof(status) - 1
@@ -613,6 +745,8 @@ void ha_mqtt_process_pending(void)
     default:
         break;
     }
+
+    blinds_flush_pending(now);
 }
 
 void ha_mqtt_publish_state(void)

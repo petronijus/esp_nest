@@ -21,6 +21,8 @@ static void ui_change_handler(ui_event_type_t type, int value)
         ha_mqtt_publish_fan();
     } else if (type == UI_EVT_VOLUME) {
         ha_mqtt_publish_volume(value);
+    } else if (type == UI_EVT_BLINDS) {
+        ha_mqtt_publish_blinds(value >> 8, value & 0xFF);
     }
 }
 
