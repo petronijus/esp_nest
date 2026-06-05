@@ -34,29 +34,33 @@ static void led_ring_task(void *arg)
             continue;
         }
 
-        if (ui_get_current_page() == 0 && ui_is_detail_mode()) {
+        /* Page accent colors, must match PAGES[] in ui.c:
+         * Lights #FFE600, Fiiuuu #00E5CC, Blinds #FB4A04, Sound #DE04FF */
+        static const uint8_t page_rgb[][3] = {
+            {255, 230,   0},
+            {  0, 229, 204},
+            {251,  74,   4},
+            {222,   4, 255},
+        };
+        int page = ui_get_current_page();
+        if (page < 0 || page > 3) page = 0;
+        const uint8_t *c = page_rgb[page];
+
+        if (page == 0 && ui_is_detail_mode()) {
             /* Brightness detail: intensity tracks brightness value directly */
             float level = (float)ui_get_brightness() / 100.0f;
-            r = (uint8_t)(255.0f * level);
-            g = (uint8_t)(230.0f * level);
-            b = 0;
+            r = (uint8_t)(c[0] * level);
+            g = (uint8_t)(c[1] * level);
+            b = (uint8_t)(c[2] * level);
         } else {
-            /* Menu mode: breathing animation */
+            /* Menu mode: breathing animation in the page accent color */
             float phase = (float)(tick % BREATH_PERIOD_MS) / (float)BREATH_PERIOD_MS;
             float breath = MIN_BRIGHTNESS +
                             (MAX_BRIGHTNESS - MIN_BRIGHTNESS) *
                             (0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI));
-            if (ui_get_current_page() == 0) {
-                /* Yellow: #FFE600 */
-                r = (uint8_t)(255.0f * breath);
-                g = (uint8_t)(230.0f * breath);
-                b = 0;
-            } else {
-                /* Teal: #00E5CC */
-                r = 0;
-                g = (uint8_t)(229.0f * breath);
-                b = (uint8_t)(204.0f * breath);
-            }
+            r = (uint8_t)(c[0] * breath);
+            g = (uint8_t)(c[1] * breath);
+            b = (uint8_t)(c[2] * breath);
         }
 
         for (int i = 0; i < NUM_LEDS; i++) {
