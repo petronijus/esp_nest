@@ -22,6 +22,21 @@ static const char *TAG = "ui";
 #define BRIGHT_CIRCLE_MAX   456
 #define BRIGHT_CIRCLE_MIN   10
 
+/* Sound detail screen constants (Figma node 94:29).  Volume is relative
+ * only — we cannot read the stereo's level, so the magenta circle gives
+ * transient feedback and always settles back to its base size. */
+#define SOUND_BASE_DIAM     154
+#define SOUND_STEP_PX        22    /* circle growth/shrink per volume step */
+#define SOUND_MIN_DIAM       60
+#define SOUND_MAX_DIAM      340
+#define SOUND_SIGN_LEN       72    /* plus/minus stroke length */
+#define SOUND_SIGN_THICK      2
+#define SOUND_SIGN_PRESSED   56    /* stroke length while "pressed" */
+#define SOUND_MINUS_X      (-157)  /* stroke centers relative to screen center */
+#define SOUND_PLUS_X         152
+#define SOUND_ACCUM_STEPS     2    /* encoder counts per volume command */
+#define SOUND_STEP_MIN_MS   120    /* min spacing between commands (IR is slow) */
+
 /* ========================================================================== */
 /*  LVGL C-array image descriptors (defined in assets)                        */
 /* ========================================================================== */
@@ -68,6 +83,7 @@ typedef enum {
     UI_MODE_MENU,
     UI_MODE_BRIGHTNESS,
     UI_MODE_FAN,
+    UI_MODE_SOUND,
 } ui_mode_t;
 
 static ui_mode_t s_mode = UI_MODE_MENU;
@@ -114,6 +130,16 @@ static lv_obj_t *s_fan_page = NULL;
 static lv_obj_t *s_fan_circles[3];   /* [0]=outer(456), [1]=mid(281), [2]=small(126) */
 static lv_obj_t *s_fan_label = NULL;
 static lv_obj_t *s_fan_hint = NULL;
+
+/* Sound detail page widgets */
+static lv_obj_t *s_sound_page = NULL;
+static lv_obj_t *s_sound_outer = NULL;
+static lv_obj_t *s_sound_circle = NULL;
+static lv_obj_t *s_sound_minus = NULL;
+static lv_obj_t *s_sound_plus_h = NULL;
+static lv_obj_t *s_sound_plus_v = NULL;
+static int s_sound_accum = 0;
+static uint32_t s_sound_last_step_ms = 0;
 
 /* ========================================================================== */
 /*  Animated arc indicator (screen-level, rotates + changes color)            */
@@ -430,6 +456,143 @@ static lv_obj_t *build_fan_detail_page(lv_obj_t *parent)
     update_fan_display();
 
     return page;
+}
+
+/* ========================================================================== */
+/*  Sound detail page                                                         */
+/* ========================================================================== */
+
+static void circle_size_cb(void *obj, int32_t value);   /* defined below */
+
+static lv_obj_t *create_sign_stroke(lv_obj_t *parent, int w, int h,
+                                     int x_ofs, int y_ofs)
+{
+    lv_obj_t *bar = lv_obj_create(parent);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, w, h);
+    lv_obj_set_style_bg_color(bar, COL_WHITE, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_align(bar, LV_ALIGN_CENTER, x_ofs, y_ofs);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    return bar;
+}
+
+static lv_obj_t *build_sound_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    /* Outer circle outline (matches brightness detail) */
+    s_sound_outer = lv_obj_create(page);
+    lv_obj_remove_style_all(s_sound_outer);
+    lv_obj_set_size(s_sound_outer, BRIGHT_OUTER_DIAM, BRIGHT_OUTER_DIAM);
+    lv_obj_set_style_radius(s_sound_outer, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_sound_outer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_sound_outer, 1, 0);
+    lv_obj_set_style_border_color(s_sound_outer, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_opa(s_sound_outer, LV_OPA_COVER, 0);
+    lv_obj_align(s_sound_outer, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(s_sound_outer, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Magenta circle (transient volume feedback) */
+    s_sound_circle = lv_obj_create(page);
+    lv_obj_remove_style_all(s_sound_circle);
+    lv_obj_set_size(s_sound_circle, SOUND_BASE_DIAM, SOUND_BASE_DIAM);
+    lv_obj_set_style_radius(s_sound_circle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_sound_circle, lv_color_hex(PAGES[3].color), 0);
+    lv_obj_set_style_bg_opa(s_sound_circle, LV_OPA_COVER, 0);
+    lv_obj_align(s_sound_circle, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(s_sound_circle, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Minus (left) and plus (right) */
+    s_sound_minus = create_sign_stroke(page, SOUND_SIGN_LEN, SOUND_SIGN_THICK,
+                                       SOUND_MINUS_X, 0);
+    s_sound_plus_h = create_sign_stroke(page, SOUND_SIGN_LEN, SOUND_SIGN_THICK,
+                                        SOUND_PLUS_X, 0);
+    s_sound_plus_v = create_sign_stroke(page, SOUND_SIGN_THICK, SOUND_SIGN_LEN,
+                                        SOUND_PLUS_X, 0);
+    return page;
+}
+
+/* --- Volume feedback: bump the circle, then settle back to base size ---
+ *
+ * Volume UP:   quick grow, then a slow shrink back to base.
+ * Volume DOWN: quick shrink, then (after an idle pause) grow back to base.
+ * The settle animation is chained from the bump so rapid steps keep
+ * re-bumping without fighting a running settle. */
+
+static int s_sound_step_dir = 0;
+
+static void sound_settle(uint32_t delay_ms, uint32_t dur_ms)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sound_circle);
+    lv_anim_set_values(&a, lv_obj_get_width(s_sound_circle), SOUND_BASE_DIAM);
+    lv_anim_set_exec_cb(&a, circle_size_cb);
+    lv_anim_set_delay(&a, delay_ms);
+    lv_anim_set_duration(&a, dur_ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void sound_bump_done_cb(lv_anim_t *a)
+{
+    if (s_sound_step_dir > 0)
+        sound_settle(250, 900);    /* slowly deflate after an up-bump */
+    else
+        sound_settle(600, 350);    /* recover to base once idle */
+}
+
+/* "Pressed" pulse on the +/- glyph: stroke shrinks a bit, then springs
+ * back (lv_anim playback).  Aligned objects re-center automatically. */
+
+static void sign_w_cb(void *obj, int32_t v) { lv_obj_set_width((lv_obj_t *)obj, v); }
+static void sign_h_cb(void *obj, int32_t v) { lv_obj_set_height((lv_obj_t *)obj, v); }
+
+static void sign_pulse(lv_obj_t *bar, bool vertical)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, bar);
+    lv_anim_set_values(&a, SOUND_SIGN_LEN, SOUND_SIGN_PRESSED);
+    lv_anim_set_exec_cb(&a, vertical ? sign_h_cb : sign_w_cb);
+    lv_anim_set_duration(&a, 90);
+    lv_anim_set_playback_duration(&a, 250);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void sound_volume_step(int dir)
+{
+    uint32_t now = lv_tick_get();
+    if (lv_tick_elaps(s_sound_last_step_ms) < SOUND_STEP_MIN_MS && s_sound_last_step_ms)
+        return;                    /* visual bump == sent command, 1:1 */
+    s_sound_last_step_ms = now;
+    s_sound_step_dir = dir;
+
+    int cur = lv_obj_get_width(s_sound_circle);
+    int target = cur + dir * SOUND_STEP_PX;
+    if (target > SOUND_MAX_DIAM) target = SOUND_MAX_DIAM;
+    if (target < SOUND_MIN_DIAM) target = SOUND_MIN_DIAM;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sound_circle);
+    lv_anim_set_values(&a, cur, target);
+    lv_anim_set_exec_cb(&a, circle_size_cb);
+    lv_anim_set_duration(&a, 90);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_completed_cb(&a, sound_bump_done_cb);
+    lv_anim_start(&a);
+
+    if (dir > 0) {
+        sign_pulse(s_sound_plus_h, false);
+        sign_pulse(s_sound_plus_v, true);
+    } else {
+        sign_pulse(s_sound_minus, false);
+    }
+
+    notify_change(UI_EVT_VOLUME, dir);
 }
 
 /* ========================================================================== */
@@ -927,6 +1090,162 @@ static void exit_fan_mode(void)
 }
 
 /* ========================================================================== */
+/*  Sound mode transitions (mirrors the brightness enter/exit choreography)   */
+/* ========================================================================== */
+
+static void enter_sound_done_cb(lv_anim_t *a)
+{
+    if (s_fade_out_target) {
+        lv_obj_add_flag(s_fade_out_target, LV_OBJ_FLAG_HIDDEN);
+        reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
+        s_fade_out_target = NULL;
+    }
+    s_animating = false;
+}
+
+static void exit_sound_done_cb(lv_anim_t *a)
+{
+    lv_obj_add_flag(s_sound_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_size(s_sound_outer, BRIGHT_OUTER_DIAM, BRIGHT_OUTER_DIAM);
+    lv_obj_center(s_sound_outer);
+    lv_obj_set_size(s_sound_circle, SOUND_BASE_DIAM, SOUND_BASE_DIAM);
+    lv_obj_center(s_sound_circle);
+    lv_obj_set_style_opa(s_sound_minus, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_sound_plus_h, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_sound_plus_v, LV_OPA_COVER, 0);
+    lv_obj_set_size(s_sound_minus, SOUND_SIGN_LEN, SOUND_SIGN_THICK);
+    lv_obj_set_size(s_sound_plus_h, SOUND_SIGN_LEN, SOUND_SIGN_THICK);
+    lv_obj_set_size(s_sound_plus_v, SOUND_SIGN_THICK, SOUND_SIGN_LEN);
+    show_arc();
+    s_animating = false;
+}
+
+static void fade_obj(lv_obj_t *obj, lv_opa_t from, lv_opa_t to, uint32_t dur,
+                     lv_anim_completed_cb_t done_cb)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_exec_cb(&a, fade_opa_cb);
+    lv_anim_set_duration(&a, dur);
+    if (done_cb) lv_anim_set_completed_cb(&a, done_cb);
+    lv_anim_start(&a);
+}
+
+static void enter_sound_mode(void)
+{
+    if (s_mode != UI_MODE_MENU || s_animating) return;
+    s_mode = UI_MODE_SOUND;
+    s_animating = true;
+    s_sound_accum = 0;
+    s_sound_last_step_ms = 0;
+
+    s_detail_last_activity = lv_tick_get();
+
+    hide_arc();
+
+    /* Children at their starting state: outer at menu-circle size,
+     * magenta circle tiny, signs invisible */
+    lv_obj_set_size(s_sound_outer, CIRCLE_DIAM, CIRCLE_DIAM);
+    lv_obj_center(s_sound_outer);
+    lv_obj_set_size(s_sound_circle, 1, 1);
+    lv_obj_center(s_sound_circle);
+    lv_obj_set_style_opa(s_sound_minus, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_opa(s_sound_plus_h, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_opa(s_sound_plus_v, LV_OPA_TRANSP, 0);
+
+    lv_obj_set_style_opa(s_sound_page, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_sound_page, LV_OBJ_FLAG_HIDDEN);
+
+    s_fade_out_target = s_pages[s_current];
+
+    /* Fade out menu page children + glow */
+    fade_children(s_pages[s_current], LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_glow(glow_index_for_page(s_pages[s_current]), LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS);
+
+    /* Grow outer outline 308 -> 456 */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_sound_outer);
+    lv_anim_set_values(&a2, CIRCLE_DIAM, BRIGHT_OUTER_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_out);
+    lv_anim_start(&a2);
+
+    /* Grow magenta circle 1 -> base */
+    lv_anim_t a3;
+    lv_anim_init(&a3);
+    lv_anim_set_var(&a3, s_sound_circle);
+    lv_anim_set_values(&a3, 1, SOUND_BASE_DIAM);
+    lv_anim_set_exec_cb(&a3, circle_size_cb);
+    lv_anim_set_duration(&a3, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a3, lv_anim_path_ease_out);
+    lv_anim_start(&a3);
+
+    /* Fade in the signs (last one carries the done callback) */
+    fade_obj(s_sound_minus, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_h, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_v, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, enter_sound_done_cb);
+
+    ESP_LOGI(TAG, "Entered sound mode");
+}
+
+static void exit_sound_mode(void)
+{
+    if (s_mode != UI_MODE_SOUND || s_animating) return;
+    s_mode = UI_MODE_MENU;
+    s_animating = true;
+
+    /* Stop any in-flight bump/settle/pulse animations */
+    lv_anim_delete(s_sound_circle, circle_size_cb);
+    lv_anim_delete(s_sound_minus, sign_w_cb);
+    lv_anim_delete(s_sound_plus_h, sign_w_cb);
+    lv_anim_delete(s_sound_plus_v, sign_h_cb);
+
+    /* Show menu page underneath + its glow, fade in */
+    lv_obj_set_style_opa(s_pages[s_current], LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_pages[s_current], LV_OBJ_FLAG_HIDDEN);
+    fade_children(s_pages[s_current], LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    {
+        int gi = glow_index_for_page(s_pages[s_current]);
+        if (gi >= 0 && s_glow[gi]) {
+            lv_obj_clear_flag(s_glow[gi], LV_OBJ_FLAG_HIDDEN);
+            fade_glow(gi, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS);
+        }
+    }
+
+    /* Shrink outer 456 -> 308 */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_sound_outer);
+    lv_anim_set_values(&a2, BRIGHT_OUTER_DIAM, CIRCLE_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_in);
+    lv_anim_start(&a2);
+
+    /* Shrink magenta circle -> 1 */
+    lv_anim_t a3;
+    lv_anim_init(&a3);
+    lv_anim_set_var(&a3, s_sound_circle);
+    lv_anim_set_values(&a3, lv_obj_get_width(s_sound_circle), 1);
+    lv_anim_set_exec_cb(&a3, circle_size_cb);
+    lv_anim_set_duration(&a3, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a3, lv_anim_path_ease_in);
+    lv_anim_start(&a3);
+
+    /* Fade out the signs (last one carries the done callback) */
+    fade_obj(s_sound_minus, LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_h, LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_v, LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, exit_sound_done_cb);
+
+    ESP_LOGI(TAG, "Exited sound mode");
+}
+
+/* ========================================================================== */
 /*  Public API                                                                */
 /* ========================================================================== */
 
@@ -963,6 +1282,11 @@ void ui_init(void)
     s_fan_page = build_fan_detail_page(s_screen);
     lv_obj_set_style_opa(s_fan_page, LV_OPA_TRANSP, 0);
     lv_obj_add_flag(s_fan_page, LV_OBJ_FLAG_HIDDEN);
+
+    /* Build sound detail page (initially hidden) */
+    s_sound_page = build_sound_page(s_screen);
+    lv_obj_set_style_opa(s_sound_page, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(s_sound_page, LV_OBJ_FLAG_HIDDEN);
 
     /* Start with page 0 visible, the rest hidden (glows follow their page) */
     lv_obj_set_style_opa(s_pages[0], LV_OPA_COVER, 0);
@@ -1029,6 +1353,16 @@ void ui_encoder_navigate(int diff)
             update_fan_display();
             notify_change(UI_EVT_FAN, s_fan_level);
         }
+    } else if (s_mode == UI_MODE_SOUND) {
+        /* CW (negative diff) = volume up, mirroring brightness */
+        s_sound_accum -= diff;
+        if (s_sound_accum >= SOUND_ACCUM_STEPS) {
+            s_sound_accum = 0;
+            sound_volume_step(+1);
+        } else if (s_sound_accum <= -SOUND_ACCUM_STEPS) {
+            s_sound_accum = 0;
+            sound_volume_step(-1);
+        }
     } else {
         /* Physical CW rotation = negative diff (same sign convention the
          * brightness detail relies on).  CW advances to the next page so
@@ -1048,12 +1382,16 @@ void ui_encoder_press(void)
             enter_brightness_mode();
         } else if (s_current == 1) {
             enter_fan_mode();
+        } else if (s_current == 3) {
+            enter_sound_mode();
         }
-        /* Blinds / Sound have no detail screens yet */
+        /* Blinds has no detail screen yet */
     } else if (s_mode == UI_MODE_BRIGHTNESS) {
         exit_brightness_mode();
     } else if (s_mode == UI_MODE_FAN) {
         exit_fan_mode();
+    } else if (s_mode == UI_MODE_SOUND) {
+        exit_sound_mode();
     }
 }
 
@@ -1168,6 +1506,8 @@ void ui_process_pending(void)
                 exit_brightness_mode();
             else if (s_mode == UI_MODE_FAN)
                 exit_fan_mode();
+            else if (s_mode == UI_MODE_SOUND)
+                exit_sound_mode();
         }
     }
 }

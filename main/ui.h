@@ -6,6 +6,7 @@
 typedef enum {
     UI_EVT_BRIGHTNESS,
     UI_EVT_FAN,
+    UI_EVT_VOLUME,      /* value: +1 = up, -1 = down (stateless, relative) */
 } ui_event_type_t;
 
 typedef void (*ui_change_cb_t)(ui_event_type_t type, int value);

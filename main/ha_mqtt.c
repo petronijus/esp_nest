@@ -28,6 +28,7 @@ static const char *FAN_TOPIC         = "bashouse/livingroom-fan";
 static const char *Z2M_LIGHT_TOPIC   = "zigbee2mqtt/livingroom_lights";
 static const char *Z2M_LIGHT_SET     = "zigbee2mqtt/livingroom_lights/set";
 static const char *Z2M_LIGHT_GET     = "zigbee2mqtt/livingroom_lights/get";
+static const char *STEREO_VOL_SET    = "bashouse/stereo/volume/set";
 
 static esp_mqtt_client_handle_t s_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
@@ -158,6 +159,18 @@ void ha_mqtt_publish_fan(void)
     s_last_pub_fan = level;
     s_last_fan_pub_time = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "Fan publish: %s", labels[level]);
+}
+
+void ha_mqtt_publish_volume(int dir)
+{
+    if (!s_connected || !s_client || dir == 0) return;
+
+    /* Stateless relative control: the stereo is driven over IR, so we
+     * only fire UP/DOWN pulses (an automation bridges this topic to NEC
+     * codes).  Rate limiting lives in the UI so feedback == command. */
+    esp_mqtt_client_publish(s_client, STEREO_VOL_SET,
+                            dir > 0 ? "UP" : "DOWN", 0, 0, 0);
+    ESP_LOGI(TAG, "Volume publish: %s", dir > 0 ? "UP" : "DOWN");
 }
 
 /* ====================================================================== */
