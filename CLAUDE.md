@@ -36,6 +36,10 @@ No middleman: HA ↔ Z2M via MQTT discovery, ESP ↔ Z2M directly via topics.
 - Fan: `bashouse/livingroom-fan` (retained text: Off/low/medium/high)
 - Stereo volume: `bashouse/stereo/volume/set` (`UP`/`DOWN`, stateless — an HA
   automation bridges it to NEC IR codes, the level cannot be read back)
+- Blinds: ESPHome bridge `blinds-cc1101/cover/rolety_{klavir|dj}_{1..3}/…`
+  (time_based covers, position 0=closed..100=open; read = average of the three
+  members' `position/state`) + `…_group/command` broadcast for full open/close.
+  Source: `~/Documents/Dev/Arduino/blinds_remote_cc1101` (HANDOVER.md there)
 - Device: `espnest/<id>/state|avail|cmd/#`, discovery under `homeassistant/…`
 - JSON is parsed with tiny hand-rolled helpers in `ha_mqtt.c` — no JSON lib.
 
