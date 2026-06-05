@@ -21,7 +21,7 @@ Home Assistant discovery.
 |---|---|
 | `main.c` | Startup + LVGL task (core 1). The LVGL loop drains `ui_process_pending()` and `ha_mqtt_process_pending()` every iteration — cross-thread work happens via pending flags, never direct LVGL calls. |
 | `screen.c` | ST7701S init, RGB panel, LVGL display + encoder indev, backlight PWM with idle dimming |
-| `ui.c` | Single LVGL screen, 2 menu pages (Lights / Fan) + 2 detail pages, fade/grow animations. Thread-safe setters (`ui_set_brightness` etc.) only set pending values. |
+| `ui.c` | Single LVGL screen, 4 menu pages driven by the `PAGES[]` table (Lights / Fiiuuu / Blinds / Sound — title, accent color, dot position, arc angle, edge glow) + detail screens for brightness, fan and sound (relative volume). The arc indicator is a solid color on purpose — a gradient was too slow. Thread-safe setters (`ui_set_brightness` etc.) only set pending values. |
 | `ha_mqtt.c` | MQTT client, HA discovery, topic routing. Thin layer — light sync logic is delegated. |
 | `light_sync.c/.h` | **Pure-logic** light synchronization state machine (no ESP-IDF includes — host-testable). |
 | `wifi.c` | STA with endless reconnect + backoff |
@@ -34,6 +34,8 @@ No middleman: HA ↔ Z2M via MQTT discovery, ESP ↔ Z2M directly via topics.
 
 - Lights: `zigbee2mqtt/livingroom_lights` (state), `…/set`, `…/get`
 - Fan: `bashouse/livingroom-fan` (retained text: Off/low/medium/high)
+- Stereo volume: `bashouse/stereo/volume/set` (`UP`/`DOWN`, stateless — an HA
+  automation bridges it to NEC IR codes, the level cannot be read back)
 - Device: `espnest/<id>/state|avail|cmd/#`, discovery under `homeassistant/…`
 - JSON is parsed with tiny hand-rolled helpers in `ha_mqtt.c` — no JSON lib.
 
