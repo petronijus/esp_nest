@@ -11,3 +11,6 @@ secrets.defaults
 # Managed components (downloaded by ESP Component Manager)
 managed_components/
 dependencies.lock
+
+# Host test binaries
+test/host/test_light_sync

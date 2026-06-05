@@ -18,6 +18,7 @@
 #include "ui.h"
 #include "screen.h"
 #include "led_ring.h"
+#include "light_sync.h"
 
 static const char *TAG = "ha_mqtt";
 
@@ -28,22 +29,17 @@ static const char *Z2M_LIGHT_TOPIC   = "zigbee2mqtt/livingroom_lights";
 static const char *Z2M_LIGHT_SET     = "zigbee2mqtt/livingroom_lights/set";
 static const char *Z2M_LIGHT_GET     = "zigbee2mqtt/livingroom_lights/get";
 
-#define LIGHT_THROTTLE_MS   300
-#define ECHO_SUPPRESS_MS    2000   /* longer window for slow Zigbee round-trips */
-#define ECHO_ACTIVE_MS      600    /* suppress ALL msgs this long after publish */
-#define ECHO_RAW_TOLERANCE  2      /* ±2 in 0-255 raw space for echo detection */
-
 static esp_mqtt_client_handle_t s_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static bool s_connected = false;
 static char s_device_id[16] = {0};
 
-static int s_last_pub_brightness = -1;
-static int s_last_pub_raw = -1;       /* raw 0-255 value we last published */
+/* Light sync state machine (throttle + authority window + resync),
+ * see light_sync.h for the design notes. */
+static light_sync_t s_light_sync;
+
 static int s_last_pub_fan = -1;
-static int64_t s_last_light_pub_time = 0;
 static int64_t s_last_fan_pub_time = 0;
-static bool s_light_pub_pending = false;
 
 static void build_device_id(void)
 {
@@ -128,46 +124,26 @@ static void build_topics(void)
 /*  Publishing: controlled light                                           */
 /* ====================================================================== */
 
-static void publish_light_now(void)
+static void publish_light_set(int brightness)
 {
-    if (!s_connected || !s_client) return;
-    int brightness = ui_get_brightness();
-    if (brightness == s_last_pub_brightness) {
-        s_light_pub_pending = false;
-        return;
-    }
-
     const char *state = (brightness == 0) ? "OFF" : "ON";
-    int raw = (brightness * 255 + 50) / 100;
-    if (raw > 255) raw = 255;
-
     char payload[64];
     snprintf(payload, sizeof(payload),
-             "{\"state\":\"%s\",\"brightness\":%d}", state, raw);
+             "{\"state\":\"%s\",\"brightness\":%d}",
+             state, light_sync_pct_to_raw(brightness));
     esp_mqtt_client_publish(s_client, Z2M_LIGHT_SET, payload, 0, 0, 0);
-
-    s_last_pub_brightness = brightness;
-    s_last_pub_raw = raw;
-    s_last_light_pub_time = esp_timer_get_time() / 1000;
-    s_light_pub_pending = false;
-
     ESP_LOGI(TAG, "Light publish: %s", payload);
 }
 
 void ha_mqtt_publish_light(void)
 {
-    if (!s_connected) return;
-    int brightness = ui_get_brightness();
-    if (brightness == s_last_pub_brightness) {
-        s_light_pub_pending = false;
-        return;
-    }
+    if (!s_connected || !s_client) return;
 
+    int brightness = ui_get_brightness();
     int64_t now = esp_timer_get_time() / 1000;
-    if (now - s_last_light_pub_time >= LIGHT_THROTTLE_MS) {
-        publish_light_now();
-    } else {
-        s_light_pub_pending = true;
+    if (light_sync_on_local_change(&s_light_sync, now, brightness)
+            == LIGHT_SYNC_ACT_PUBLISH) {
+        publish_light_set(brightness);
     }
 }
 
@@ -259,81 +235,21 @@ static void handle_light_message(const char *data, int len)
     int br = -1;
     bool have_state = parse_json_string(msg, "state", state_str, sizeof(state_str));
     bool have_br = parse_json_int(msg, "brightness", &br);
+    bool state_on = have_state && str_eq_icase(state_str, "ON");
 
-    /* --- Two-phase echo suppression ---
-     *
-     * Phase 1 (active period, 0..ECHO_ACTIVE_MS after publish):
-     *   User may still be rotating the encoder.  Suppress ALL incoming
-     *   messages to prevent flicker from stale echoes.
-     *
-     * Phase 2 (echo tail, ECHO_ACTIVE_MS..ECHO_SUPPRESS_MS):
-     *   Compare the incoming raw brightness to what we published.
-     *   Suppress if it matches (within tolerance) — it's our own echo.
-     *   Let through messages with a different value — those are external
-     *   commands from Home Assistant / other controllers.
-     */
     int64_t now = esp_timer_get_time() / 1000;
-    int64_t since_pub = now - s_last_light_pub_time;
-
-    if (s_light_pub_pending) {
-        ESP_LOGD(TAG, "Ignoring light msg (publish pending)");
+    int new_level = light_sync_on_state_msg(&s_light_sync, now,
+                                            have_state, state_on,
+                                            have_br, br,
+                                            ui_get_brightness());
+    if (new_level < 0) {
+        ESP_LOGD(TAG, "Light msg ignored (raw br=%d state=%s)", br, state_str);
         return;
     }
 
-    if (s_last_light_pub_time > 0 && since_pub < ECHO_ACTIVE_MS) {
-        ESP_LOGD(TAG, "Ignoring light msg (active period, %lld ms)",
-                 (long long)since_pub);
-        return;
-    }
-
-    if (s_last_light_pub_time > 0 && since_pub < ECHO_SUPPRESS_MS
-        && s_last_pub_raw >= 0 && have_br) {
-        if (br >= 0 && abs(br - s_last_pub_raw) <= ECHO_RAW_TOLERANCE) {
-            ESP_LOGD(TAG, "Suppressing light echo (raw=%d≈pub %d, %lld ms)",
-                     br, s_last_pub_raw, (long long)since_pub);
-            return;
-        }
-    }
-
-    /* --- Process the message --- */
-
-    int new_level = ui_get_brightness();
-
-    if (have_br) {
-        if (br < 0) br = 0;
-        if (br > 255) br = 255;
-        new_level = (br == 0) ? 0 : (int)((br * 100 + 127) / 255);
-    }
-
-    if (have_state) {
-        if (str_eq_icase(state_str, "OFF")) {
-            new_level = 0;
-        } else if (str_eq_icase(state_str, "ON") && !have_br && new_level == 0) {
-            new_level = 100;
-        }
-    }
-
-    /* Rounding guard: if the incoming raw brightness converts back to
-     * the same raw we published (or within ±1), the 0-100% values may
-     * differ by 1 due to integer math.  Suppress such phantom changes
-     * to prevent slow oscillation (e.g. 50%→128→127→49%→128→…). */
-    if (new_level != ui_get_brightness()
-        && s_last_pub_raw >= 0 && have_br && br >= 0) {
-        int our_raw = (ui_get_brightness() * 255 + 50) / 100;
-        if (abs(br - our_raw) <= ECHO_RAW_TOLERANCE) {
-            ESP_LOGD(TAG, "Suppressing rounding artifact "
-                     "(mqtt %d%% raw=%d, ui %d%% raw=%d)",
-                     new_level, br, ui_get_brightness(), our_raw);
-            return;
-        }
-    }
-
-    if (new_level != ui_get_brightness()) {
-        s_last_pub_brightness = new_level;
-        ui_set_brightness(new_level);
-        ESP_LOGI(TAG, "Light from MQTT: %d%% (raw br=%d state=%s)",
-                 new_level, br, state_str);
-    }
+    ui_set_brightness(new_level);
+    ESP_LOGI(TAG, "Light from MQTT: %d%% (raw br=%d state=%s)",
+             new_level, br, state_str);
 }
 
 static void handle_device_command(const char *subtopic, const char *data, int len)
@@ -558,10 +474,9 @@ static void subscribe_all(void)
 
 static void request_current_state(void)
 {
+    /* Z2M replies on the state topic with the full state incl. brightness */
     esp_mqtt_client_publish(s_client, Z2M_LIGHT_GET,
                             "{\"state\":\"\"}", 0, 0, 0);
-    esp_mqtt_client_publish(s_client, Z2M_LIGHT_GET,
-                            "{\"brightness\":\"\"}", 0, 0, 0);
 }
 
 static void mqtt_event_handler(void *arg, esp_event_base_t base,
@@ -576,12 +491,10 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
         publish_ha_discovery();
         subscribe_all();
+        light_sync_init(&s_light_sync);
         request_current_state();
         publish_device_state();
-        s_last_pub_brightness = -1;
-        s_last_pub_raw = -1;
         s_last_pub_fan = -1;
-        s_last_light_pub_time = 0;
         s_last_fan_pub_time = 0;
         break;
 
@@ -640,6 +553,7 @@ esp_err_t ha_mqtt_init(void)
 {
     build_device_id();
     build_topics();
+    light_sync_init(&s_light_sync);
     s_mqtt_event_group = xEventGroupCreate();
 
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -671,10 +585,20 @@ esp_err_t ha_mqtt_init(void)
 
 void ha_mqtt_process_pending(void)
 {
-    if (!s_light_pub_pending) return;
+    if (!s_connected || !s_client) return;
+
     int64_t now = esp_timer_get_time() / 1000;
-    if (now - s_last_light_pub_time >= LIGHT_THROTTLE_MS) {
-        publish_light_now();
+    int brightness;
+    switch (light_sync_tick(&s_light_sync, now, &brightness)) {
+    case LIGHT_SYNC_ACT_PUBLISH:
+        publish_light_set(brightness);
+        break;
+    case LIGHT_SYNC_ACT_RESYNC:
+        ESP_LOGD(TAG, "Authority window closed, requesting light state");
+        request_current_state();
+        break;
+    default:
+        break;
     }
 }
 
