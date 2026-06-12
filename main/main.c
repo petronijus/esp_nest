@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
 #include "lvgl.h"
 #include "screen.h"
 #include "ui.h"
@@ -65,13 +66,14 @@ static void update_status_line(void)
     char buf[128];
     bool wifi = wifi_is_connected();
     bool mqtt = ha_mqtt_is_connected();
+    const char *ver = esp_app_get_description()->version;
 
     if (!wifi) {
-        snprintf(buf, sizeof(buf), "WiFi: disconnected");
+        snprintf(buf, sizeof(buf), "WiFi: disconnected | v%s", ver);
     } else if (!mqtt) {
-        snprintf(buf, sizeof(buf), "IP: %s | MQTT: offline", wifi_get_ip_str());
+        snprintf(buf, sizeof(buf), "IP: %s | MQTT: offline | v%s", wifi_get_ip_str(), ver);
     } else {
-        snprintf(buf, sizeof(buf), "IP: %s | MQTT: ok", wifi_get_ip_str());
+        snprintf(buf, sizeof(buf), "IP: %s | MQTT: ok | v%s", wifi_get_ip_str(), ver);
     }
     ui_set_status(buf);
 }
