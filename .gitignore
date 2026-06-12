@@ -14,3 +14,9 @@ dependencies.lock
 
 # Host test binaries
 test/host/test_light_sync
+
+# Local node env for lv_font_conv (never commit)
+.nodeenv/
+
+# Private overlay (clone of esp_nest-private)
+/private/

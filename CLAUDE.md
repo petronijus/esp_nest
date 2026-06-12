@@ -39,7 +39,7 @@ No middleman: HA ↔ Z2M via MQTT discovery, ESP ↔ Z2M directly via topics.
 - Blinds: ESPHome bridge `blinds-cc1101/cover/rolety_{klavir|dj}_{1..3}/…`
   (time_based covers, position 0=closed..100=open; read = average of the three
   members' `position/state`) + `…_group/command` broadcast for full open/close.
-  Source: `~/Documents/Dev/Arduino/blinds_remote_cc1101` (HANDOVER.md there)
+  The CC1101 bridge is a separate private project — pointer in `private/ops/notes.md`.
 - Device: `espnest/<id>/state|avail|cmd/#`, discovery under `homeassistant/…`
 - JSON is parsed with tiny hand-rolled helpers in `ha_mqtt.c` — no JSON lib.
 
@@ -95,3 +95,12 @@ make -C test/host run    # must print "0 failures"
 
 Any change to `light_sync.c` needs a scenario test — including a regression
 test when fixing a sync bug (see the `BUG n regression` scenarios).
+
+## Repo conventions (public repo)
+
+- Conventional commits: `feat:` / `fix:` / `chore:` / `docs:` / `refactor:`.
+- Releases are cut with the `repo-release` skill; config in `.release.yml`.
+  Never tag or edit CHANGELOG.md manually.
+- Private overlay: `private/` (gitignored) = clone of `petronijus/esp_nest-private`
+  — ops notes, device details. Bootstrap:
+  `git clone git@github.com:petronijus/esp_nest-private.git private`

@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build firmware
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.3
+          target: esp32s3
+          command: |
+            idf.py build
+            cd build && esptool.py --chip esp32s3 merge_bin -o factory.bin @flash_args
+
+      - name: Prepare release assets
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          cp build/ZX2D10GE01R.bin "esp_nest-${TAG}-ota.bin"
+          cp build/factory.bin "esp_nest-${TAG}-factory.bin"
+          sha256sum esp_nest-${TAG}-*.bin > sha256sums.txt
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          gh release create "$TAG" --verify-tag --generate-notes || true
+          gh release upload "$TAG" esp_nest-${TAG}-*.bin sha256sums.txt --clobber

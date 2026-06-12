@@ -1,0 +1,16 @@
+name: esp_nest
+tag_format: v{version}
+version_files:
+  - path: version.txt
+changelog: CHANGELOG.md
+artifacts:
+  mode: ci
+  ci_workflow: release.yml
+  expect_assets:
+    - "esp_nest-*-ota.bin"
+    - "esp_nest-*-factory.bin"
+    - "sha256sums.txt"
+registry:
+  images: []
+preflight_extra:
+  - make -C test/host run
