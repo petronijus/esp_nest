@@ -54,7 +54,7 @@ idf.py -p <port> flash
 ```bash
 curl -F "firmware=@build/ZX2D10GE01R.bin" http://<device-ip>/update
 # or pull a released build and push it in one step:
-./scripts/ota-update.sh v0.1.0 <device-ip>
+./scripts/ota-update.sh v2.0.0 <device-ip>
 ```
 
 > ⚠️ **Security:** the OTA endpoint is intentionally unauthenticated — anyone
