@@ -5,13 +5,15 @@ All notable changes to ESP Nest. Format follows
 [SemVer](https://semver.org/).
 
 ## [Unreleased]
+
+## [2.0.1] - 2026-06-14
 ### Changed
 - External MQTT topic names (lights, fan, stereo, blinds) and the two
   on-screen blinds labels are now Kconfig options (`TOPIC_*`) with generic
   defaults instead of hardcoded values — override them in `secrets.defaults`
   (or `idf.py menuconfig`). Removes personal home-topology details from the
-  public source; existing devices keep working once their real topics are set
-  in `secrets.defaults` before the next build/flash.
+  public source and the released binaries; existing devices keep working once
+  their real topics are set in `secrets.defaults` before the next build/flash.
 
 ## [2.0.0] - 2026-06-12
 
