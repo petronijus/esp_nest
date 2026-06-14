@@ -31,12 +31,14 @@ Home Assistant discovery.
 ## MQTT topology
 
 No middleman: HA ↔ Z2M via MQTT discovery, ESP ↔ Z2M directly via topics.
+All external topic names are Kconfig options (`TOPIC_*` in `main/Kconfig.projbuild`);
+defaults are generic, real values live in `secrets.defaults` (gitignored).
 
-- Lights: `zigbee2mqtt/livingroom_lights` (state), `…/set`, `…/get`
-- Fan: `bashouse/livingroom-fan` (retained text: Off/low/medium/high)
-- Stereo volume: `bashouse/stereo/volume/set` (`UP`/`DOWN`, stateless — an HA
+- Lights: `<TOPIC_LIGHTS>` (state), `…/set`, `…/get`
+- Fan: `<TOPIC_FAN>` (retained text: Off/low/medium/high)
+- Stereo volume: `<TOPIC_STEREO_VOL>/set` (`UP`/`DOWN`, stateless — an HA
   automation bridges it to NEC IR codes, the level cannot be read back)
-- Blinds: ESPHome bridge `blinds-cc1101/cover/rolety_{klavir|dj}_{1..3}/…`
+- Blinds: ESPHome bridge `<TOPIC_BLINDS_PREFIX>/<group>_{1..3}/…` for two groups
   (time_based covers, position 0=closed..100=open; read = average of the three
   members' `position/state`) + `…_group/command` broadcast for full open/close.
   The CC1101 bridge is a separate private project — pointer in `private/ops/notes.md`.

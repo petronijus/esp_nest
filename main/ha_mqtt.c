@@ -24,38 +24,43 @@ static const char *TAG = "ha_mqtt";
 
 #define MQTT_CONNECTED_BIT BIT0
 
-static const char *FAN_TOPIC         = "bashouse/livingroom-fan";
-static const char *Z2M_LIGHT_TOPIC   = "zigbee2mqtt/livingroom_lights";
-static const char *Z2M_LIGHT_SET     = "zigbee2mqtt/livingroom_lights/set";
-static const char *Z2M_LIGHT_GET     = "zigbee2mqtt/livingroom_lights/get";
-static const char *STEREO_VOL_SET    = "bashouse/stereo/volume/set";
+static const char *FAN_TOPIC         = CONFIG_TOPIC_FAN;
+static const char *Z2M_LIGHT_TOPIC   = CONFIG_TOPIC_LIGHTS;
+static const char *Z2M_LIGHT_SET     = CONFIG_TOPIC_LIGHTS "/set";
+static const char *Z2M_LIGHT_GET     = CONFIG_TOPIC_LIGHTS "/get";
+static const char *STEREO_VOL_SET    = CONFIG_TOPIC_STEREO_VOL "/set";
 
-/* RF blinds: ESPHome "blinds-cc1101" bridge, MQTT-native (Wemos + CC1101,
- * dead-reckoning time_based covers; see Dev/Arduino/blinds_remote_cc1101).
- * Six member covers carry position 0-100 (0 = closed); the two group
- * covers are broadcast-only (single RF burst, no position).  Strategy:
- * full open/close goes through the group broadcast, intermediate steps
- * via position/command to all three members.  Position is read back as
- * the average of the three members.  Index: 0=Klavir 1=DJ (matches ui.c). */
+/* RF blinds: ESPHome cover bridge, MQTT-native (Wemos + CC1101,
+ * dead-reckoning time_based covers).  Six member covers carry position
+ * 0-100 (0 = closed); the two group covers are broadcast-only (single RF
+ * burst, no position).  Strategy: full open/close goes through the group
+ * broadcast, intermediate steps via position/command to all three members.
+ * Position is read back as the average of the three members.  Index:
+ * 0 = group A, 1 = group B (matches ui.c).  Topics are assembled from the
+ * Kconfig TOPIC_BLINDS_* options via adjacent string-literal concatenation,
+ * so they stay compile-time constants with no runtime cost. */
+#define BL_  CONFIG_TOPIC_BLINDS_PREFIX
+#define BGA_ CONFIG_TOPIC_BLINDS_GROUP_A
+#define BGB_ CONFIG_TOPIC_BLINDS_GROUP_B
 static const char *BLINDS_POS_STATE[2][3] = {
-    { "blinds-cc1101/cover/rolety_klavir_1/position/state",
-      "blinds-cc1101/cover/rolety_klavir_2/position/state",
-      "blinds-cc1101/cover/rolety_klavir_3/position/state" },
-    { "blinds-cc1101/cover/rolety_dj_1/position/state",
-      "blinds-cc1101/cover/rolety_dj_2/position/state",
-      "blinds-cc1101/cover/rolety_dj_3/position/state" },
+    { BL_ "/" BGA_ "_1/position/state",
+      BL_ "/" BGA_ "_2/position/state",
+      BL_ "/" BGA_ "_3/position/state" },
+    { BL_ "/" BGB_ "_1/position/state",
+      BL_ "/" BGB_ "_2/position/state",
+      BL_ "/" BGB_ "_3/position/state" },
 };
 static const char *BLINDS_POS_CMD[2][3] = {
-    { "blinds-cc1101/cover/rolety_klavir_1/position/command",
-      "blinds-cc1101/cover/rolety_klavir_2/position/command",
-      "blinds-cc1101/cover/rolety_klavir_3/position/command" },
-    { "blinds-cc1101/cover/rolety_dj_1/position/command",
-      "blinds-cc1101/cover/rolety_dj_2/position/command",
-      "blinds-cc1101/cover/rolety_dj_3/position/command" },
+    { BL_ "/" BGA_ "_1/position/command",
+      BL_ "/" BGA_ "_2/position/command",
+      BL_ "/" BGA_ "_3/position/command" },
+    { BL_ "/" BGB_ "_1/position/command",
+      BL_ "/" BGB_ "_2/position/command",
+      BL_ "/" BGB_ "_3/position/command" },
 };
 static const char *BLINDS_GROUP_CMD[2] = {
-    "blinds-cc1101/cover/rolety_klavir_group/command",
-    "blinds-cc1101/cover/rolety_dj_group/command",
+    BL_ "/" BGA_ "_group/command",
+    BL_ "/" BGB_ "_group/command",
 };
 
 #define BLINDS_POS_MAX_STEP  6
@@ -242,7 +247,7 @@ static void blinds_flush_pending(int64_t now)
                 esp_mqtt_client_publish(s_client, BLINDS_POS_CMD[t][m],
                                         payload, 0, 0, 0);
             ESP_LOGI(TAG, "Blinds publish: %s x3 = %s",
-                     t == 0 ? "klavir" : "dj", payload);
+                     t == 0 ? BGA_ : BGB_, payload);
         }
         s_blinds_pending[t] = -1;
         s_blinds_block_until[t] = now + BLINDS_BLOCK_MS;
@@ -282,7 +287,7 @@ static void handle_blinds_position(int target, int member,
     int step = blinds_pos_to_step(sum / cnt);
     ui_set_blinds_pos(target, step);
     ESP_LOGI(TAG, "Blinds %s position from MQTT: avg %d%% (step %d)",
-             target == 0 ? "Klavir" : "DJ", sum / cnt, step);
+             target == 0 ? BGA_ : BGB_, sum / cnt, step);
 }
 
 void ha_mqtt_publish_volume(int dir)
@@ -655,7 +660,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
             handle_fan_message(event->data, event->data_len);
         } else if (strcmp(topic_buf, Z2M_LIGHT_TOPIC) == 0) {
             handle_light_message(event->data, event->data_len);
-        } else if (strncmp(topic_buf, "blinds-cc1101/", 14) == 0) {
+        } else if (strncmp(topic_buf, BL_ "/", sizeof(BL_ "/") - 1) == 0) {
             for (int t = 0; t < 2; t++)
                 for (int m = 0; m < 3; m++)
                     if (strcmp(topic_buf, BLINDS_POS_STATE[t][m]) == 0)

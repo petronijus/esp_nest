@@ -64,8 +64,10 @@ curl -F "firmware=@build/ZX2D10GE01R.bin" http://<device-ip>/update
 ## MQTT topology
 
 No middleman: Home Assistant ↔ zigbee2mqtt via MQTT discovery, ESP ↔ z2m
-directly via topics. The topic names are defined at the top of
-`main/ha_mqtt.c` — adjust them to your own z2m/ESPHome entity names.
+directly via topics. Topic names are Kconfig options (`TOPIC_*` in
+`main/Kconfig.projbuild`, or via `idf.py menuconfig`); the defaults are
+generic — override them in `secrets.defaults` to match your own z2m/ESPHome
+entity names.
 
 - Lights: `zigbee2mqtt/<group>` state/set/get
 - Fan: retained text topic (Off/low/medium/high)

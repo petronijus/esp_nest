@@ -1,6 +1,7 @@
 #include "ui.h"
 #include <stdio.h>
 #include <string.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "led_ring.h"
 
@@ -162,9 +163,9 @@ static lv_obj_t *s_blinds_outer = NULL;            /* outline ring */
 static lv_obj_t *s_blinds_fill = NULL;             /* orange full circle */
 static lv_obj_t *s_blinds_cover = NULL;            /* black slider */
 static lv_obj_t *s_blinds_lines[BLINDS_LINE_COUNT];
-static lv_obj_t *s_blinds_lbl_klavir = NULL;
-static lv_obj_t *s_blinds_lbl_dj = NULL;
-static int s_blinds_sel = 0;               /* 0 = Klavír, 1 = DJ */
+static lv_obj_t *s_blinds_lbl_a = NULL;
+static lv_obj_t *s_blinds_lbl_b = NULL;
+static int s_blinds_sel = 0;               /* 0 = group A, 1 = group B */
 static int s_blinds_pos[2] = {0, 0};       /* per-target: 0 open .. 6 closed */
 static int s_blinds_accum = 0;
 static int s_blinds_h = 0;                 /* currently shown fill height */
@@ -533,9 +534,9 @@ static void blinds_cover_anim_cb(void *obj, int32_t v)
 
 static void blinds_update_labels(void)
 {
-    lv_obj_set_style_text_color(s_blinds_lbl_klavir,
+    lv_obj_set_style_text_color(s_blinds_lbl_a,
         s_blinds_sel == 0 ? COL_WHITE : COL_BLINDS_UNSEL, 0);
-    lv_obj_set_style_text_color(s_blinds_lbl_dj,
+    lv_obj_set_style_text_color(s_blinds_lbl_b,
         s_blinds_sel == 1 ? COL_WHITE : COL_BLINDS_UNSEL, 0);
 }
 
@@ -608,21 +609,21 @@ static lv_obj_t *build_blinds_page(lv_obj_t *parent)
     lv_obj_clear_flag(s_blinds_outer, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     /* Target labels (over the fill, NOT clipped) */
-    s_blinds_lbl_klavir = lv_label_create(page);
-    lv_label_set_text(s_blinds_lbl_klavir, "Klavír");
-    lv_obj_set_style_text_font(s_blinds_lbl_klavir, &font_helvetica_100, 0);
-    lv_obj_set_style_text_letter_space(s_blinds_lbl_klavir, -5, 0);
-    lv_obj_set_style_text_align(s_blinds_lbl_klavir, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_blinds_lbl_klavir, LV_ALIGN_CENTER, 0, -24);
-    lv_obj_clear_flag(s_blinds_lbl_klavir, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    s_blinds_lbl_a = lv_label_create(page);
+    lv_label_set_text(s_blinds_lbl_a, CONFIG_TOPIC_BLINDS_LABEL_A);
+    lv_obj_set_style_text_font(s_blinds_lbl_a, &font_helvetica_100, 0);
+    lv_obj_set_style_text_letter_space(s_blinds_lbl_a, -5, 0);
+    lv_obj_set_style_text_align(s_blinds_lbl_a, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_blinds_lbl_a, LV_ALIGN_CENTER, 0, -24);
+    lv_obj_clear_flag(s_blinds_lbl_a, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
-    s_blinds_lbl_dj = lv_label_create(page);
-    lv_label_set_text(s_blinds_lbl_dj, "DJ");
-    lv_obj_set_style_text_font(s_blinds_lbl_dj, &font_helvetica_100, 0);
-    lv_obj_set_style_text_letter_space(s_blinds_lbl_dj, -5, 0);
-    lv_obj_set_style_text_align(s_blinds_lbl_dj, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_blinds_lbl_dj, LV_ALIGN_CENTER, 0, 52);
-    lv_obj_clear_flag(s_blinds_lbl_dj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    s_blinds_lbl_b = lv_label_create(page);
+    lv_label_set_text(s_blinds_lbl_b, CONFIG_TOPIC_BLINDS_LABEL_B);
+    lv_obj_set_style_text_font(s_blinds_lbl_b, &font_helvetica_100, 0);
+    lv_obj_set_style_text_letter_space(s_blinds_lbl_b, -5, 0);
+    lv_obj_set_style_text_align(s_blinds_lbl_b, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_blinds_lbl_b, LV_ALIGN_CENTER, 0, 52);
+    lv_obj_clear_flag(s_blinds_lbl_b, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     blinds_update_labels();
 
@@ -634,7 +635,9 @@ static void blinds_toggle_sel(void)
     s_blinds_sel ^= 1;
     blinds_update_labels();
     blinds_show_pos(true);
-    ESP_LOGI(TAG, "Blinds target: %s", s_blinds_sel == 0 ? "Klavir" : "DJ");
+    ESP_LOGI(TAG, "Blinds target: %s",
+             s_blinds_sel == 0 ? CONFIG_TOPIC_BLINDS_LABEL_A
+                               : CONFIG_TOPIC_BLINDS_LABEL_B);
 }
 
 static void blinds_move(int dir)
@@ -648,7 +651,9 @@ static void blinds_move(int dir)
     blinds_show_pos(true);
     notify_change(UI_EVT_BLINDS, (s_blinds_sel << 8) | next);
     ESP_LOGI(TAG, "Blinds %s -> %d/%d",
-             s_blinds_sel == 0 ? "Klavir" : "DJ", next, BLINDS_POS_MAX);
+             s_blinds_sel == 0 ? CONFIG_TOPIC_BLINDS_LABEL_A
+                               : CONFIG_TOPIC_BLINDS_LABEL_B,
+             next, BLINDS_POS_MAX);
 }
 
 /* ========================================================================== */

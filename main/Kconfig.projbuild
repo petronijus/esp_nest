@@ -41,3 +41,63 @@ menu "MQTT Configuration"
             Password for MQTT broker authentication.
 
 endmenu
+
+menu "MQTT Topics (external devices)"
+
+    config TOPIC_FAN
+        string "Fan topic"
+        default "home/fan"
+        help
+            Retained text topic for a fan (payloads: Off/low/medium/high).
+
+    config TOPIC_LIGHTS
+        string "Lights base topic (zigbee2mqtt group)"
+        default "zigbee2mqtt/lights"
+        help
+            Base topic of a zigbee2mqtt light group. "/set" and "/get"
+            are appended automatically.
+
+    config TOPIC_STEREO_VOL
+        string "Stereo volume base topic"
+        default "home/stereo/volume"
+        help
+            Base topic for relative stereo volume. "/set" is appended;
+            payloads are UP/DOWN, typically bridged to IR by an automation.
+
+endmenu
+
+menu "Blinds (ESPHome RF cover bridge)"
+
+    config TOPIC_BLINDS_PREFIX
+        string "Blinds MQTT prefix"
+        default "blinds/cover"
+        help
+            MQTT prefix of the ESPHome cover bridge. Member and group topics
+            are built as <prefix>/<group>_<n>/position/{state,command} and
+            <prefix>/<group>_group/command.
+
+    config TOPIC_BLINDS_GROUP_A
+        string "Blinds group A id"
+        default "group_a"
+        help
+            Topic id of the first blinds group (three member covers _1.._3).
+
+    config TOPIC_BLINDS_GROUP_B
+        string "Blinds group B id"
+        default "group_b"
+        help
+            Topic id of the second blinds group (three member covers _1.._3).
+
+    config TOPIC_BLINDS_LABEL_A
+        string "Blinds group A on-screen label"
+        default "A"
+        help
+            Label shown on the blinds page for group A.
+
+    config TOPIC_BLINDS_LABEL_B
+        string "Blinds group B on-screen label"
+        default "B"
+        help
+            Label shown on the blinds page for group B.
+
+endmenu
