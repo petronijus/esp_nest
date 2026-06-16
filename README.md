@@ -32,7 +32,15 @@ idf.py build                                   # output: build/ZX2D10GE01R.bin
 ```
 
 `secrets.defaults` is gitignored and loaded by the root `CMakeLists.txt` as an
-extra sdkconfig-defaults file. Firmware version comes from `version.txt`.
+extra sdkconfig-defaults file (WiFi/MQTT credentials and, optionally, your own
+MQTT topic overrides). Firmware version comes from `version.txt`.
+
+> **Maintainer note:** the real `secrets.defaults` is kept SOPS-encrypted in the
+> private overlay (`private/config/secrets.defaults.sops`) so it syncs across
+> machines without plaintext in git. With the overlay cloned and the 1Password
+> CLI signed in, run `./scripts/secrets-decrypt.sh` to materialize it (the age
+> key is fetched from 1Password), or `./scripts/secrets-edit.sh` to change it.
+> Without the overlay, just copy `secrets.defaults.example` and fill it in.
 
 ## Flash
 
