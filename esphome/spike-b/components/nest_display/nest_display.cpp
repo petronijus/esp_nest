@@ -90,15 +90,21 @@ static void panel_init_over_spi() {
   dev.queue_size = 1;
   ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &s_spi));
 
+  // The panel has no reset line and keeps its registers across MCU resets
+  // (an earlier firmware's SDIR survived an OTA reboot): always start from a
+  // software reset so every register below is in a known state.
+  lcd_cmd(0x01, nullptr, 0);
+  vTaskDelay(pdMS_TO_TICKS(120));
+
   for (const auto &c : INIT_SEQ)
     lcd_cmd(c.cmd, c.data, c.len);
-  if (s_hw_mirror_x) {
-    // SDIR (0xC7) lives in command bank 0x10; bit 2 reverses the source
-    // (column) direction, so the panel itself performs the X half of 180°.
-    const uint8_t bk0[] = {0x77, 0x01, 0x00, 0x00, 0x10}, sdir[] = {0x04};
-    lcd_cmd(0xFF, bk0, sizeof bk0);
-    lcd_cmd(0xC7, sdir, sizeof sdir);
-  }
+  // SDIR (0xC7) lives in command bank 0x10; bit 2 reverses the source
+  // (column) direction, so the panel itself performs the X half of 180°.
+  // Written in both modes so the result never depends on prior panel state.
+  const uint8_t bk0[] = {0x77, 0x01, 0x00, 0x00, 0x10};
+  const uint8_t sdir[] = {static_cast<uint8_t>(s_hw_mirror_x ? 0x04 : 0x00)};
+  lcd_cmd(0xFF, bk0, sizeof bk0);
+  lcd_cmd(0xC7, sdir, sizeof sdir);
   const uint8_t bk_off[] = {0x77, 0x01, 0x00, 0x00, 0x00}, madctl[] = {0x00}, colmod[] = {0x66};
   lcd_cmd(0xFF, bk_off, sizeof bk_off);
   lcd_cmd(0x36, madctl, sizeof madctl);

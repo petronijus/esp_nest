@@ -25,3 +25,5 @@ test/host/test_light_sync
 esphome/**/.esphome/
 esphome/**/secrets.yaml
 __pycache__/
+esphome/fallback/
+esphome/**/compile*.log
