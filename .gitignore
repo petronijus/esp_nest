@@ -20,3 +20,8 @@ test/host/test_light_sync
 
 # Private overlay (clone of esp_nest-private)
 /private/
+
+# ESPHome build state and secrets
+esphome/**/.esphome/
+esphome/**/secrets.yaml
+__pycache__/
