@@ -46,7 +46,7 @@ Generated 2026-10-10 from a multi-agent design pass (4 researchers, 1 architect,
 
 # ESP Nest on ESPHome 2026.9.1, variant B: target architecture for milestone 1 (behaviour parity)
 
-**Notation.** `E` = `/home/petronijus/.local/share/uv/tools/esphome/lib/python3.12/site-packages/esphome`. Repo paths are relative to `/home/petronijus/Documents/Dev/esp_nest`.
+**Notation.** `E` = the installed ESPHome package (`uv tool install esphome==2026.9.1` → `~/.local/share/uv/tools/esphome/lib/python3.12/site-packages/esphome`). Repo paths are relative to the repository root.
 
 **Guiding rules**
 - ESPHome owns the platform: WiFi, native API, OTA, safe_mode, web_server, the MQTT client and the diagnostic entities.

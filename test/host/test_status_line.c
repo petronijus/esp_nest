@@ -23,12 +23,12 @@ static void test_states(void)
     CHECK_STR(buf, "WiFi: disconnected | v3.0.0");
     CHECK_EQ(n, (int)strlen(buf));
 
-    n = status_line_format(buf, sizeof buf, true, IP(192, 168, 20, 213), false, "3.0.0");
-    CHECK_STR(buf, "IP: 192.168.20.213 | MQTT: offline | v3.0.0");
+    n = status_line_format(buf, sizeof buf, true, IP(198, 51, 100, 213), false, "3.0.0");
+    CHECK_STR(buf, "IP: 198.51.100.213 | MQTT: offline | v3.0.0");
     CHECK_EQ(n, (int)strlen(buf));
 
-    n = status_line_format(buf, sizeof buf, true, IP(192, 168, 20, 213), true, "3.0.0");
-    CHECK_STR(buf, "IP: 192.168.20.213 | MQTT: ok | v3.0.0");
+    n = status_line_format(buf, sizeof buf, true, IP(198, 51, 100, 213), true, "3.0.0");
+    CHECK_STR(buf, "IP: 198.51.100.213 | MQTT: ok | v3.0.0");
     CHECK_EQ(n, (int)strlen(buf));
 }
 
@@ -60,10 +60,10 @@ static void test_truncation(void)
     char buf[16];
     memset(buf, 'z', sizeof buf);
 
-    int n = status_line_format(buf, sizeof buf, true, IP(192, 168, 20, 213), true, "3.0.0");
-    CHECK_EQ(n, (int)strlen("IP: 192.168.20.213 | MQTT: ok | v3.0.0"));
+    int n = status_line_format(buf, sizeof buf, true, IP(198, 51, 100, 213), true, "3.0.0");
+    CHECK_EQ(n, (int)strlen("IP: 198.51.100.213 | MQTT: ok | v3.0.0"));
     CHECK_EQ(strlen(buf), sizeof buf - 1);
-    CHECK_STR(buf, "IP: 192.168.20.");
+    CHECK_STR(buf, "IP: 198.51.100.");
 
     /* The native buffer holds the longest possible line with a long version */
     char big[STATUS_LINE_SIZE];
