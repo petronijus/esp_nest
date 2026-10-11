@@ -37,6 +37,10 @@
 # Environment:
 #   CONTAINER_ENGINE   docker or podman (default: docker when its daemon
 #                      answers, else podman).
+#   CHECK_DEV_ENTRY    1 (default) validates the dev entry with the real
+#                      secrets and private substitutions; 0 skips only that
+#                      part of the esphome step, for CI (the release
+#                      workflow), which has neither.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && git rev-parse --show-toplevel)"
@@ -251,17 +255,21 @@ step_esphome() {
   run_logged "config esphome/esp-nest.yaml (generic package, dummy secrets)" \
     config-generic esphome config "$SNAP/esphome/esp-nest.yaml"
 
-  [ -f "$REPO/private/esphome/substitutions.yaml" ] \
-    || fail "private/esphome/substitutions.yaml missing — clone or pull the private overlay into ./private"
-  [ -f "$REPO/esphome/secrets.yaml" ] \
-    || fail "esphome/secrets.yaml missing — run scripts/secrets-decrypt.sh"
-  local missing
-  missing="$(comm -23 <(yaml_keys "$REPO/esphome/secrets.example.yaml" | sort) \
-                      <(yaml_keys "$REPO/esphome/secrets.yaml" | sort))"
-  [ -z "$missing" ] \
-    || fail "esphome/secrets.yaml lacks $(printf '%s' "$missing" | tr '\n' ' ') (names in secrets.example.yaml) — pull the private overlay and re-run scripts/secrets-decrypt.sh"
-  run_logged "config esphome/esp-nest-dev.yaml (working tree, real secrets)" \
-    config-dev esphome config "$REPO/esphome/esp-nest-dev.yaml"
+  if [ "${CHECK_DEV_ENTRY:-1}" = 0 ]; then
+    say "  skipped: config esphome/esp-nest-dev.yaml (CHECK_DEV_ENTRY=0: no private overlay here)"
+  else
+    [ -f "$REPO/private/esphome/substitutions.yaml" ] \
+      || fail "private/esphome/substitutions.yaml missing — clone or pull the private overlay into ./private"
+    [ -f "$REPO/esphome/secrets.yaml" ] \
+      || fail "esphome/secrets.yaml missing — run scripts/secrets-decrypt.sh"
+    local missing
+    missing="$(comm -23 <(yaml_keys "$REPO/esphome/secrets.example.yaml" | sort) \
+                        <(yaml_keys "$REPO/esphome/secrets.yaml" | sort))"
+    [ -z "$missing" ] \
+      || fail "esphome/secrets.yaml lacks $(printf '%s' "$missing" | tr '\n' ' ') (names in secrets.example.yaml) — pull the private overlay and re-run scripts/secrets-decrypt.sh"
+    run_logged "config esphome/esp-nest-dev.yaml (working tree, real secrets)" \
+      config-dev esphome config "$REPO/esphome/esp-nest-dev.yaml"
+  fi
 
   # The blinds label validator (esp_nest/__init__.py) must reject what
   # would render wrong: a character the label font has no glyph for, a
