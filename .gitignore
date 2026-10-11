@@ -12,8 +12,14 @@ secrets.defaults
 managed_components/
 dependencies.lock
 
-# Host test binaries
-test/host/test_light_sync
+# Host test build output (binaries; see test/host/Makefile)
+test/host/build/
+
+# macOS debug-symbol bundles produced by the host-test builds
+test/host/*.dSYM/
+
+# Editor/tooling caches (clangd index etc.)
+.cache/
 
 # Local node env for lv_font_conv (never commit)
 .nodeenv/

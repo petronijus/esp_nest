@@ -38,9 +38,18 @@ MQTT topic overrides). Firmware version comes from `version.txt`.
 > **Maintainer note:** the real `secrets.defaults` is kept SOPS-encrypted in the
 > private overlay (`private/config/secrets.defaults.sops`) so it syncs across
 > machines without plaintext in git. With the overlay cloned and the 1Password
-> CLI signed in, run `./scripts/secrets-decrypt.sh` to materialize it (the age
-> key is fetched from 1Password), or `./scripts/secrets-edit.sh` to change it.
-> Without the overlay, just copy `secrets.defaults.example` and fill it in.
+> CLI signed in, run `./scripts/secrets-decrypt.sh` to materialize it together
+> with the ESPHome build's `esphome/secrets.yaml` (the age key is fetched from
+> 1Password), or `./scripts/secrets-edit.sh [native|esphome]` to change one of
+> them. Without the overlay, just copy `secrets.defaults.example` and fill it in.
+
+### UI assets
+
+The compiled UI assets (page glow images and the pre-rasterized fonts) live as
+C arrays in `esphome/esp-nest-components/esp_nest/`, a single copy shared by
+the native build (via `components/esp_nest_shared`) and the ESPHome component.
+Their design sources and the exact regeneration commands are in
+[`assets/`](assets/README.md).
 
 ## Flash
 
@@ -89,7 +98,8 @@ entity names.
 Echoes of our own `/set` publishes are indistinguishable from external
 commands on the state topic. Do **not** reintroduce value-comparison echo
 detection — it was tried and caused brightness jump-backs and stuck ON states.
-Current design (`main/light_sync.h`, pure logic, host-testable):
+Current design (`esphome/esp-nest-components/esp_nest/light_sync.h`, pure
+logic, host-testable, shared by the native and the ESPHome build):
 
 1. Local changes throttled to one publish / 300 ms.
 2. Every publish (re)opens a 1.5 s **authority window**; all incoming state
@@ -105,11 +115,25 @@ even when changes race the window.
 Pure-logic modules have host-side tests (plain gcc, no ESP-IDF):
 
 ```bash
-make -C test/host run    # must print "0 failures"
+make -C test/host run    # must end with "=== N test binaries, 0 failed"
 ```
 
 Any change to `light_sync.c` needs a scenario test, including a regression
 test when fixing a sync bug.
+
+The whole local gate — host tests, ESPHome config and compile with the
+partition-table check, the Home Assistant remote-package smoke test, the
+native ESP-IDF 5.5.3 build in the `espressif/idf:v5.5.3` container, and a
+check that no plaintext secrets are tracked — is one command, also run by the
+release preflight:
+
+```bash
+scripts/check.sh            # all steps; or e.g. scripts/check.sh host esphome
+```
+
+It needs ESPHome 2026.9.1, Docker or Podman, and (for the dev entry) the
+private overlay plus `esphome/secrets.yaml`; see
+[`esphome/README.md`](esphome/README.md#local-gate).
 
 ## Releases
 

@@ -1,0 +1,1956 @@
+/*
+ * ESP Nest UI: port of the native firmware's main/ui.c (v2.0.1, frozen) to
+ * LVGL 9.6. Layout, animations, encoder mapping and timings are unchanged;
+ * the differences are the hosting (see nest_ui.h):
+ *
+ *   - LVGL 9.6 API: the per-flag setters (lv_obj_set_hidden, ...) instead
+ *     of the deprecated lv_obj_add/clear/has_flag, and
+ *     lv_anim_set_reverse_duration instead of the playback duration.
+ *   - The state other tasks read (brightness, fan level, page, mode) and
+ *     the pending slots are C11 atomics; every change is computed first
+ *     and then stored once, so a reader never sees an intermediate value.
+ *     Pending slots are consumed with atomic_exchange(-1).
+ *   - Time is the int64 esp_timer clock (ui_clock_ms), never the uint32
+ *     lv_tick_get(), which wraps after 49.7 days.
+ *   - The blinds labels come from the component config
+ *     (nest_ui_set_blinds_labels) instead of Kconfig.
+ *   - The status line is set on the nest_ui task only (no cross-task
+ *     string buffer), and the LED ring feedback goes through the
+ *     ui_led_feedback() hook.
+ *   - Logging goes through NEST_LOGx (nest_c.h) to the ESPHome logger:
+ *     IDF's ESP_LOGx in C is gated by the IDF log level (ERROR by
+ *     default), which would drop every INFO line.
+ *   - The LVGL entry points refuse calls from any task but nest_ui
+ *     (NEST_C_ASSERT_UI_TASK).
+ *
+ * Compiled as C: LVGL 9.6 enum ORs that C++ rejects stay valid here.
+ */
+
+#include "nest_ui.h"
+
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "esp_timer.h"
+#include "lvgl.h"
+#include "nest_c.h"
+
+static const char *TAG = "esp_nest.ui";
+
+#define SCREEN_COUNT    4
+#define CIRCLE_DIAM     308
+#define DOT_SIZE        19
+#define FADE_TIME_MS    300
+
+/* Colors matching Figma design */
+#define COL_BLACK       lv_color_hex(0x000000)
+#define COL_YELLOW      lv_color_hex(0xFFE600)
+#define COL_TEAL        lv_color_hex(0x00E5CC)
+#define COL_CIRCLE      lv_color_hex(0x888888)
+#define COL_WHITE       lv_color_hex(0xFFFFFF)
+
+/* Brightness detail screen constants */
+#define BRIGHT_OUTER_DIAM   456
+#define BRIGHT_CIRCLE_MAX   456
+#define BRIGHT_CIRCLE_MIN   10
+
+/* Sound detail screen constants (Figma node 94:29).  Volume is relative
+ * only — we cannot read the stereo's level, so the magenta circle gives
+ * transient feedback and always settles back to its base size. */
+#define SOUND_BASE_DIAM     154
+#define SOUND_STEP_PX        22    /* circle growth/shrink per volume step */
+#define SOUND_MIN_DIAM       60
+#define SOUND_MAX_DIAM      340
+#define SOUND_SIGN_LEN       72    /* plus/minus stroke length */
+#define SOUND_SIGN_THICK      2
+#define SOUND_SIGN_PRESSED   56    /* stroke length while "pressed" */
+#define SOUND_MINUS_X      (-157)  /* stroke centers relative to screen center */
+#define SOUND_PLUS_X         152
+#define SOUND_ACCUM_STEPS     2    /* encoder counts per volume command */
+#define SOUND_STEP_MIN_MS   120    /* min spacing between commands (IR is slow) */
+
+/* Blinds detail screen constants (Figma 94:40 / 94:97 / 94:112).
+ * The circle is divided into a 77px grid: 5 chord lines plus the top and
+ * bottom edges give 7 snap positions (0 = open .. 6 = fully closed).
+ * The orange fill drops from the top and snaps to these steps. */
+#define BLINDS_DIAM         462
+#define BLINDS_POS_MAX        6
+#define BLINDS_STEP_PX       77
+#define BLINDS_TOP_INSET     76    /* first line, local y inside the circle */
+#define BLINDS_LINE_COUNT     5
+#define BLINDS_SNAP_MS      150
+#define BLINDS_ACCUM_STEPS    2
+#define COL_BLINDS_LINE     lv_color_hex(0x7B7B7B)
+#define COL_BLINDS_UNSEL    lv_color_hex(0x575757)
+
+/* ========================================================================== */
+/*  LVGL C-array image descriptors (defined in assets)                        */
+/* ========================================================================== */
+
+extern const lv_image_dsc_t bg_glow_yellow;
+extern const lv_image_dsc_t bg_glow_teal;
+extern const lv_image_dsc_t bg_glow_orange;
+extern const lv_image_dsc_t bg_glow_purple;
+
+/* ==========================================================================
+ *  Menu page definitions (Figma nodes 11:69, 11:83, 90:2, 93:2)
+ *
+ *  All four pages share the same four dot positions on the r=154 circle;
+ *  the active page's dot is filled with the page accent color.  The arc
+ *  indicator sits at the active dot's angle (LVGL angles: 0 = 3 o'clock,
+ *  clockwise).  The background glow hugs a different screen edge per page.
+ * ========================================================================== */
+
+typedef struct {
+    const char *title;
+    uint32_t    color;          /* page accent (dot, arc, LED ring) */
+    int         arc_deg;        /* dot angle on the circle, LVGL CW */
+    int         dot_x, dot_y;   /* dot center offset from screen center */
+    const lv_image_dsc_t *glow;
+    lv_align_t  glow_align;
+} page_def_t;
+
+static const page_def_t PAGES[SCREEN_COUNT] = {
+    { "Lights", 0xFFE600, 270,    0, -154, &bg_glow_yellow, LV_ALIGN_TOP_MID    },
+    { "Fiiuuu", 0x00E5CC, 328,  130,  -81, &bg_glow_teal,   LV_ALIGN_RIGHT_MID  },
+    { "Blinds", 0xFB4A04,  90,    0,  154, &bg_glow_orange, LV_ALIGN_BOTTOM_MID },
+    { "Sound",  0xDE04FF, 148, -131,   82, &bg_glow_purple, LV_ALIGN_LEFT_MID   },
+};
+
+/* Pre-rasterized bitmap fonts (generated by lv_font_conv) */
+LV_FONT_DECLARE(font_cambria_140);
+LV_FONT_DECLARE(font_helvetica_140);
+LV_FONT_DECLARE(font_helvetica_100);
+
+/* ========================================================================== */
+/*  UI mode state                                                             */
+/* ========================================================================== */
+
+typedef enum {
+    UI_MODE_MENU,
+    UI_MODE_BRIGHTNESS,
+    UI_MODE_FAN,
+    UI_MODE_SOUND,
+    UI_MODE_BLINDS,
+} ui_mode_t;
+
+/* Written on the nest_ui task only; also read by other tasks (getters).
+ * Holds a ui_mode_t. */
+static atomic_int s_mode = UI_MODE_MENU;
+static atomic_int s_brightness = 30;
+static int s_last_nonzero_brightness = 100;
+/* Set before the nest_ui task starts, read on it. */
+static ui_change_cb_t s_change_cb = NULL;
+
+/* Pending values from other tasks, -1 = none; last writer wins. */
+static atomic_int s_pending_brightness = -1;
+static atomic_int s_pending_fan = -1;
+static atomic_int s_pending_blinds[2] = {-1, -1};
+
+#define DETAIL_IDLE_TIMEOUT_MS 60000
+static int64_t s_detail_last_activity = 0;
+
+/* The UI clock: int64 milliseconds since boot. lv_tick_get() is uint32 and
+ * wraps after 49.7 days. */
+static int64_t ui_clock_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static void notify_change(ui_event_type_t type, int value)
+{
+    if (s_change_cb) s_change_cb(type, value);
+}
+
+/* Native ui.c cleared CLICKABLE | SCROLLABLE on every decorative object. */
+static void obj_set_passive(lv_obj_t *obj)
+{
+    lv_obj_set_clickable(obj, false);
+    lv_obj_set_scrollable(obj, false);
+}
+
+/* Fan detail state: 0=off, 1=low, 2=medium, 3=high */
+static atomic_int s_fan_level = 0;
+static int s_last_nonzero_fan = 1;   /* default "low" when no last mode known */
+static int s_fan_accum = 0;
+
+/* Single screen with page containers */
+static lv_obj_t *s_screen = NULL;
+static lv_obj_t *s_glow[SCREEN_COUNT];
+static lv_obj_t *s_pages[SCREEN_COUNT];
+static atomic_int s_current = 0;
+static bool s_animating = false;
+static lv_obj_t *s_status_label = NULL;
+
+/* Brightness detail page widgets */
+static lv_obj_t *s_bright_page = NULL;
+static lv_obj_t *s_bright_outer = NULL;
+static lv_obj_t *s_bright_circle = NULL;
+static lv_obj_t *s_bright_label = NULL;
+static lv_obj_t *s_bright_hint = NULL;
+
+
+/* Fan detail page widgets */
+static lv_obj_t *s_fan_page = NULL;
+static lv_obj_t *s_fan_circles[3];   /* [0]=outer(456), [1]=mid(281), [2]=small(126) */
+static lv_obj_t *s_fan_label = NULL;
+static lv_obj_t *s_fan_hint = NULL;
+
+/* Blinds detail page widgets.
+ *
+ * Mask-free composition (clip_corner would need a huge render layer):
+ * a full orange circle sits at the bottom of the stack, a black "cover"
+ * rectangle slides over it from the fill edge downward, and the step
+ * lines live INSIDE the cover (parent bounds clip them), so they are
+ * only visible in the not-yet-closed part.  Chord lengths are
+ * precomputed so nothing pokes out of the circle. */
+static lv_obj_t *s_blinds_page = NULL;
+static lv_obj_t *s_blinds_outer = NULL;            /* outline ring */
+static lv_obj_t *s_blinds_fill = NULL;             /* orange full circle */
+static lv_obj_t *s_blinds_cover = NULL;            /* black slider */
+static lv_obj_t *s_blinds_lines[BLINDS_LINE_COUNT];
+static lv_obj_t *s_blinds_lbl_a = NULL;
+static lv_obj_t *s_blinds_lbl_b = NULL;
+/* Group labels (nest_ui_set_blinds_labels; native: Kconfig defaults). */
+static const char *s_blinds_label[2] = {"A", "B"};
+static int s_blinds_sel = 0;               /* 0 = group A, 1 = group B */
+static int s_blinds_pos[2] = {0, 0};       /* per-target: 0 open .. 6 closed */
+static int s_blinds_accum = 0;
+static int s_blinds_h = 0;                 /* currently shown fill height */
+
+/* Sound detail page widgets */
+static lv_obj_t *s_sound_page = NULL;
+static lv_obj_t *s_sound_outer = NULL;
+static lv_obj_t *s_sound_circle = NULL;
+static lv_obj_t *s_sound_minus = NULL;
+static lv_obj_t *s_sound_plus_h = NULL;
+static lv_obj_t *s_sound_plus_v = NULL;
+static int s_sound_accum = 0;
+#define SOUND_NO_STEP (-1)                 /* no command sent yet */
+static int64_t s_sound_last_step_ms = SOUND_NO_STEP;
+
+/* ========================================================================== */
+/*  Animated arc indicator (screen-level, rotates + changes color)            */
+/* ========================================================================== */
+
+#define ARC_HALF_SPAN 32
+
+static lv_obj_t *s_menu_circle = NULL;
+static lv_obj_t *s_arc = NULL;
+
+static int s_arc_from_deg;
+static int s_arc_delta_deg;
+static lv_color_t s_arc_from_color;
+static lv_color_t s_arc_to_color;
+
+static void update_arc(int center_deg, lv_color_t color)
+{
+    center_deg = ((center_deg % 360) + 360) % 360;
+    int start = (center_deg - ARC_HALF_SPAN + 360) % 360;
+    int end   = (center_deg + ARC_HALF_SPAN) % 360;
+    lv_arc_set_bg_angles(s_arc, start, end);
+    lv_obj_set_style_arc_color(s_arc, color, LV_PART_MAIN);
+}
+
+static void init_circle(lv_obj_t *parent)
+{
+    s_menu_circle = lv_obj_create(parent);
+    lv_obj_remove_style_all(s_menu_circle);
+    lv_obj_set_size(s_menu_circle, CIRCLE_DIAM, CIRCLE_DIAM);
+    lv_obj_set_style_radius(s_menu_circle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_menu_circle, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_menu_circle, 1, 0);
+    lv_obj_set_style_border_color(s_menu_circle, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_opa(s_menu_circle, LV_OPA_COVER, 0);
+    lv_obj_align(s_menu_circle, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_floating(s_menu_circle, true);
+    obj_set_passive(s_menu_circle);
+}
+
+static void init_arc(lv_obj_t *parent)
+{
+    s_arc = lv_arc_create(parent);
+    lv_obj_remove_style_all(s_arc);
+    lv_obj_set_size(s_arc, CIRCLE_DIAM, CIRCLE_DIAM);
+    lv_obj_set_floating(s_arc, true);
+
+    lv_arc_set_rotation(s_arc, 0);
+    lv_arc_set_range(s_arc, 0, 100);
+    lv_arc_set_value(s_arc, 0);
+
+    lv_obj_set_style_arc_width(s_arc, 2, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(s_arc, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(s_arc, false, LV_PART_MAIN);
+
+    lv_obj_set_style_arc_opa(s_arc, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_arc, 0, LV_PART_KNOB);
+
+    lv_obj_align(s_arc, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_arc);
+
+    update_arc(270, COL_YELLOW);
+}
+
+static void arc_rotate_anim_cb(void *var, int32_t progress)
+{
+    int deg = s_arc_from_deg + s_arc_delta_deg * progress / 255;
+
+    /* Solid color crossfade between the page accents — intentionally NOT
+     * a gradient arc, which was too slow to render on this panel. */
+    lv_color_t color = lv_color_mix(s_arc_to_color, s_arc_from_color,
+                                    (uint8_t)progress);
+    update_arc(deg, color);
+}
+
+/* ========================================================================== */
+/*  Image helpers                                                             */
+/* ========================================================================== */
+
+static lv_obj_t *create_image(lv_obj_t *parent, const lv_image_dsc_t *dsc,
+                               lv_align_t align, int x_ofs, int y_ofs)
+{
+    lv_obj_t *img = lv_image_create(parent);
+    lv_image_set_src(img, dsc);
+    lv_obj_align(img, align, x_ofs, y_ofs);
+    obj_set_passive(img);
+    lv_obj_set_floating(img, true);
+    return img;
+}
+
+/* ========================================================================== */
+/*  Drawing helpers                                                           */
+/* ========================================================================== */
+
+static lv_obj_t *create_page_container(lv_obj_t *parent)
+{
+    lv_obj_t *page = lv_obj_create(parent);
+    lv_obj_remove_style_all(page);
+    lv_obj_set_size(page, 480, 480);
+    lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, 0);
+    lv_obj_set_pos(page, 0, 0);
+    obj_set_passive(page);
+    lv_obj_set_floating(page, true);
+    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_pad_all(page, 0, 0);
+    return page;
+}
+
+static lv_obj_t *create_dot(lv_obj_t *parent, bool filled, lv_color_t color,
+                             int x_offset, int y_offset)
+{
+    lv_obj_t *dot = lv_obj_create(parent);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, DOT_SIZE, DOT_SIZE);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+
+    if (filled) {
+        lv_obj_set_style_bg_color(dot, color, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_set_style_bg_opa(dot, LV_OPA_TRANSP, 0);
+    }
+
+    lv_obj_set_style_border_width(dot, filled ? 0 : 2, 0);
+    if (!filled) {
+        lv_obj_set_style_border_color(dot, COL_CIRCLE, 0);
+        lv_obj_set_style_border_opa(dot, LV_OPA_70, 0);
+    }
+
+    lv_obj_align(dot, LV_ALIGN_CENTER, x_offset, y_offset);
+    obj_set_passive(dot);
+    return dot;
+}
+
+static lv_obj_t *create_title(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, COL_WHITE, 0);
+    lv_obj_set_style_text_font(lbl, &font_cambria_140, 0);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(lbl);
+    return lbl;
+}
+
+/* ========================================================================== */
+/*  Page builders (children of the single screen)                             */
+/* ========================================================================== */
+
+static lv_obj_t *build_menu_page(lv_obj_t *parent, int page_idx)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    /* All four dots at their fixed circle positions; the dot belonging
+     * to this page is filled with the page accent color. */
+    for (int j = 0; j < SCREEN_COUNT; j++) {
+        bool active = (j == page_idx);
+        create_dot(page, active,
+                   active ? lv_color_hex(PAGES[j].color) : COL_CIRCLE,
+                   PAGES[j].dot_x, PAGES[j].dot_y);
+    }
+    create_title(page, PAGES[page_idx].title);
+
+    return page;
+}
+
+/* ========================================================================== */
+/*  Brightness detail page                                                    */
+/* ========================================================================== */
+
+static void update_brightness_display(void)
+{
+    if (!s_bright_label || !s_bright_circle) return;
+
+    const int brightness = s_brightness;
+
+    /* Update number */
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", brightness);
+    lv_label_set_text(s_bright_label, buf);
+
+    /* Update yellow circle size: scale linearly from MIN to MAX */
+    if (brightness <= 0) {
+        lv_obj_set_hidden(s_bright_circle, true);
+    } else {
+        int diam = BRIGHT_CIRCLE_MIN +
+                   (BRIGHT_CIRCLE_MAX - BRIGHT_CIRCLE_MIN) * brightness / 100;
+        lv_obj_set_hidden(s_bright_circle, false);
+        lv_obj_set_size(s_bright_circle, diam, diam);
+        lv_obj_center(s_bright_circle);
+    }
+}
+
+static lv_obj_t *build_brightness_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    /* Outer circle outline */
+    s_bright_outer = lv_obj_create(page);
+    lv_obj_remove_style_all(s_bright_outer);
+    lv_obj_set_size(s_bright_outer, BRIGHT_OUTER_DIAM, BRIGHT_OUTER_DIAM);
+    lv_obj_set_style_radius(s_bright_outer, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_bright_outer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_bright_outer, 1, 0);
+    lv_obj_set_style_border_color(s_bright_outer, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_opa(s_bright_outer, LV_OPA_COVER, 0);
+    lv_obj_align(s_bright_outer, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_bright_outer);
+
+    /* Yellow filled circle (dynamic size based on brightness) */
+    s_bright_circle = lv_obj_create(page);
+    lv_obj_remove_style_all(s_bright_circle);
+    lv_obj_set_style_radius(s_bright_circle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_bright_circle, COL_YELLOW, 0);
+    lv_obj_set_style_bg_opa(s_bright_circle, LV_OPA_COVER, 0);
+    lv_obj_align(s_bright_circle, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_bright_circle);
+
+    /* Brightness number */
+    s_bright_label = lv_label_create(page);
+    lv_label_set_text(s_bright_label, "30");
+    lv_obj_set_style_text_color(s_bright_label, COL_WHITE, 0);
+    lv_obj_set_style_text_font(s_bright_label, &font_helvetica_140, 0);
+    lv_obj_set_style_text_align(s_bright_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_bright_label, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_bright_label);
+
+    /* Hint text */
+    s_bright_hint = lv_label_create(page);
+    lv_label_set_text(s_bright_hint, "long press to toggle");
+    lv_obj_set_style_text_color(s_bright_hint, COL_WHITE, 0);
+    lv_obj_set_style_text_font(s_bright_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(s_bright_hint, 3, 0);
+    lv_obj_set_style_text_align(s_bright_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_bright_hint, LV_ALIGN_CENTER, 0, 90);
+    obj_set_passive(s_bright_hint);
+
+    /* Set initial display */
+    update_brightness_display();
+
+    return page;
+}
+
+/* ========================================================================== */
+/*  Fan detail page                                                           */
+/* ========================================================================== */
+
+#define FAN_OUTER_DIAM  456
+#define FAN_MID_DIAM    281
+#define FAN_SMALL_DIAM  126
+
+static const char *fan_level_names[] = {"off", "low", "medium", "high"};
+
+static void update_fan_display(void)
+{
+    if (!s_fan_label) return;
+
+    const int level = s_fan_level;
+    lv_label_set_text(s_fan_label, fan_level_names[level]);
+
+    for (int i = 0; i < 3; i++) {
+        /* Circle index 0 = outer (fills at level 3),
+         * 1 = mid (fills at level >= 2), 2 = small (fills at level >= 1).
+         * So circle i is filled when level >= (3 - i). */
+        bool filled = (level >= (3 - i));
+
+        if (filled) {
+            lv_obj_set_style_bg_color(s_fan_circles[i], COL_TEAL, 0);
+            lv_obj_set_style_bg_opa(s_fan_circles[i], LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(s_fan_circles[i], 0, 0);
+        } else {
+            lv_obj_set_style_bg_opa(s_fan_circles[i], LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(s_fan_circles[i], 1, 0);
+            lv_obj_set_style_border_color(s_fan_circles[i], lv_color_hex(0x444444), 0);
+            lv_obj_set_style_border_opa(s_fan_circles[i], LV_OPA_COVER, 0);
+        }
+    }
+}
+
+static lv_obj_t *build_fan_detail_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    static const int diams[] = {FAN_OUTER_DIAM, FAN_MID_DIAM, FAN_SMALL_DIAM};
+
+    for (int i = 0; i < 3; i++) {
+        s_fan_circles[i] = lv_obj_create(page);
+        lv_obj_remove_style_all(s_fan_circles[i]);
+        lv_obj_set_size(s_fan_circles[i], diams[i], diams[i]);
+        lv_obj_set_style_radius(s_fan_circles[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(s_fan_circles[i], LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s_fan_circles[i], 1, 0);
+        lv_obj_set_style_border_color(s_fan_circles[i], lv_color_hex(0x444444), 0);
+        lv_obj_set_style_border_opa(s_fan_circles[i], LV_OPA_COVER, 0);
+        lv_obj_align(s_fan_circles[i], LV_ALIGN_CENTER, 0, 0);
+        obj_set_passive(s_fan_circles[i]);
+    }
+
+    s_fan_label = lv_label_create(page);
+    lv_label_set_text(s_fan_label, "off");
+    lv_obj_set_style_text_color(s_fan_label, COL_WHITE, 0);
+    lv_obj_set_style_text_font(s_fan_label, &font_helvetica_140, 0);
+    lv_obj_set_style_text_align(s_fan_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_fan_label, LV_ALIGN_CENTER, 0, 19);
+    obj_set_passive(s_fan_label);
+
+    s_fan_hint = lv_label_create(page);
+    lv_label_set_text(s_fan_hint, "long press to toggle");
+    lv_obj_set_style_text_color(s_fan_hint, COL_WHITE, 0);
+    lv_obj_set_style_text_font(s_fan_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(s_fan_hint, 3, 0);
+    lv_obj_set_style_text_align(s_fan_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_fan_hint, LV_ALIGN_CENTER, 0, 90);
+    obj_set_passive(s_fan_hint);
+
+    update_fan_display();
+
+    return page;
+}
+
+/* ========================================================================== */
+/*  Blinds detail page                                                        */
+/* ========================================================================== */
+
+static void circle_size_cb(void *obj, int32_t value);   /* defined below */
+
+/* Circle-top y on screen and chord lengths at the 5 step lines
+ * (dy from center: -155,-78,-1,+76,+153; chord = 2*sqrt(R^2-dy^2)) */
+#define BLINDS_TOP_Y   ((480 - BLINDS_DIAM) / 2)
+static const int BLINDS_CHORD[BLINDS_LINE_COUNT] = {342, 434, 462, 436, 346};
+
+/* Label positions: the v2.0.1 offsets from the screen centre, tuned for
+ * the v2.0.1 metrics of font_helvetica_100 (line height 75, baseline 2 px
+ * above the bottom of the line). The font was regenerated with Czech
+ * diacritics (decision D6); its taller line box moves the baseline of a
+ * centred label. blinds_label_baseline_fix() restores the v2.0.1 baseline
+ * for whatever metrics the font has now. */
+#define BLINDS_LABEL_A_Y            (-24)
+#define BLINDS_LABEL_B_Y            52
+#define BLINDS_LABEL_V201_LINE_H    75
+#define BLINDS_LABEL_V201_BASE_LINE 2
+
+/* Baseline of a single-line label centred at offset 0 in a 480 px parent,
+ * by LVGL's own integer math: LV_ALIGN_CENTER puts the label top at
+ * 480/2 - h/2, and the glyphs sit on top + (line_height - base_line). */
+static int blinds_label_baseline(int line_height, int base_line)
+{
+    return 480 / 2 - line_height / 2 + line_height - base_line;
+}
+
+/* Offset correction that puts the labels' baseline where v2.0.1 drew it
+ * (+1 px for the regenerated 113/22 metrics). */
+static int blinds_label_baseline_fix(void)
+{
+    return blinds_label_baseline(BLINDS_LABEL_V201_LINE_H, BLINDS_LABEL_V201_BASE_LINE)
+         - blinds_label_baseline(font_helvetica_100.line_height, font_helvetica_100.base_line);
+}
+
+/* Orange fill height for a snap position (local px inside the circle) */
+static int blinds_fill_height(int pos)
+{
+    if (pos <= 0) return 0;
+    if (pos >= BLINDS_POS_MAX) return BLINDS_DIAM;
+    return BLINDS_TOP_INSET + (pos - 1) * BLINDS_STEP_PX;
+}
+
+/* Position the cover and counter-shift its child lines so the lines
+ * stay at fixed screen positions while the cover slides. */
+static void blinds_cover_set(int h)
+{
+    s_blinds_h = h;
+    lv_obj_align(s_blinds_cover, LV_ALIGN_TOP_MID, 0, BLINDS_TOP_Y + h);
+    for (int i = 0; i < BLINDS_LINE_COUNT; i++)
+        lv_obj_set_y(s_blinds_lines[i],
+                     BLINDS_TOP_INSET + i * BLINDS_STEP_PX - h);
+}
+
+static void blinds_cover_anim_cb(void *obj, int32_t v)
+{
+    blinds_cover_set(v);
+}
+
+static void blinds_update_labels(void)
+{
+    lv_obj_set_style_text_color(s_blinds_lbl_a,
+        s_blinds_sel == 0 ? COL_WHITE : COL_BLINDS_UNSEL, 0);
+    lv_obj_set_style_text_color(s_blinds_lbl_b,
+        s_blinds_sel == 1 ? COL_WHITE : COL_BLINDS_UNSEL, 0);
+}
+
+/* Snap-animate the cover to the selected target's position */
+static void blinds_show_pos(bool animate)
+{
+    int target = blinds_fill_height(s_blinds_pos[s_blinds_sel]);
+    if (target == s_blinds_h) return;
+
+    if (!animate) {
+        blinds_cover_set(target);
+        return;
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_blinds_cover);
+    lv_anim_set_values(&a, s_blinds_h, target);
+    lv_anim_set_exec_cb(&a, blinds_cover_anim_cb);
+    lv_anim_set_duration(&a, BLINDS_SNAP_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static lv_obj_t *build_blinds_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    /* Orange circle (the "closed" state, bottom of the stack) */
+    s_blinds_fill = lv_obj_create(page);
+    lv_obj_remove_style_all(s_blinds_fill);
+    lv_obj_set_size(s_blinds_fill, BLINDS_DIAM, BLINDS_DIAM);
+    lv_obj_set_style_radius(s_blinds_fill, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_blinds_fill, lv_color_hex(PAGES[2].color), 0);
+    lv_obj_set_style_bg_opa(s_blinds_fill, LV_OPA_COVER, 0);
+    lv_obj_align(s_blinds_fill, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_blinds_fill);
+
+    /* Black cover sliding over the orange circle; the step lines are its
+     * children so the parent bounds clip them to the uncovered zone. */
+    s_blinds_cover = lv_obj_create(page);
+    lv_obj_remove_style_all(s_blinds_cover);
+    lv_obj_set_size(s_blinds_cover, 480, 480);
+    lv_obj_set_style_bg_color(s_blinds_cover, COL_BLACK, 0);
+    lv_obj_set_style_bg_opa(s_blinds_cover, LV_OPA_COVER, 0);
+    obj_set_passive(s_blinds_cover);
+    lv_obj_set_scrollbar_mode(s_blinds_cover, LV_SCROLLBAR_MODE_OFF);
+
+    for (int i = 0; i < BLINDS_LINE_COUNT; i++) {
+        lv_obj_t *line = lv_obj_create(s_blinds_cover);
+        lv_obj_remove_style_all(line);
+        lv_obj_set_size(line, BLINDS_CHORD[i], 1);
+        lv_obj_set_style_bg_color(line, COL_BLINDS_LINE, 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+        lv_obj_set_x(line, (480 - BLINDS_CHORD[i]) / 2);
+        obj_set_passive(line);
+        s_blinds_lines[i] = line;
+    }
+    blinds_cover_set(0);
+
+    /* Outline ring on top of fill + cover */
+    s_blinds_outer = lv_obj_create(page);
+    lv_obj_remove_style_all(s_blinds_outer);
+    lv_obj_set_size(s_blinds_outer, BLINDS_DIAM, BLINDS_DIAM);
+    lv_obj_set_style_radius(s_blinds_outer, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_blinds_outer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_blinds_outer, 1, 0);
+    lv_obj_set_style_border_color(s_blinds_outer, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_opa(s_blinds_outer, LV_OPA_COVER, 0);
+    lv_obj_align(s_blinds_outer, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_blinds_outer);
+
+    /* Target labels (over the fill, NOT clipped), on the v2.0.1 baseline */
+    const int label_fix = blinds_label_baseline_fix();
+    s_blinds_lbl_a = lv_label_create(page);
+    lv_label_set_text(s_blinds_lbl_a, s_blinds_label[0]);
+    lv_obj_set_style_text_font(s_blinds_lbl_a, &font_helvetica_100, 0);
+    lv_obj_set_style_text_letter_space(s_blinds_lbl_a, -5, 0);
+    lv_obj_set_style_text_align(s_blinds_lbl_a, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_blinds_lbl_a, LV_ALIGN_CENTER, 0, BLINDS_LABEL_A_Y + label_fix);
+    obj_set_passive(s_blinds_lbl_a);
+
+    s_blinds_lbl_b = lv_label_create(page);
+    lv_label_set_text(s_blinds_lbl_b, s_blinds_label[1]);
+    lv_obj_set_style_text_font(s_blinds_lbl_b, &font_helvetica_100, 0);
+    lv_obj_set_style_text_letter_space(s_blinds_lbl_b, -5, 0);
+    lv_obj_set_style_text_align(s_blinds_lbl_b, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_blinds_lbl_b, LV_ALIGN_CENTER, 0, BLINDS_LABEL_B_Y + label_fix);
+    obj_set_passive(s_blinds_lbl_b);
+
+    blinds_update_labels();
+
+    return page;
+}
+
+static void blinds_toggle_sel(void)
+{
+    s_blinds_sel ^= 1;
+    blinds_update_labels();
+    blinds_show_pos(true);
+    NEST_LOGI(TAG, "Blinds target: %s",
+             s_blinds_label[s_blinds_sel]);
+}
+
+static void blinds_move(int dir)
+{
+    int *pos = &s_blinds_pos[s_blinds_sel];
+    int next = *pos + dir;
+    if (next < 0) next = 0;
+    if (next > BLINDS_POS_MAX) next = BLINDS_POS_MAX;
+    if (next == *pos) return;
+    *pos = next;
+    blinds_show_pos(true);
+    notify_change(UI_EVT_BLINDS, (s_blinds_sel << 8) | next);
+    NEST_LOGI(TAG, "Blinds %s -> %d/%d",
+             s_blinds_label[s_blinds_sel],
+             next, BLINDS_POS_MAX);
+}
+
+/* ========================================================================== */
+/*  Sound detail page                                                         */
+/* ========================================================================== */
+
+static lv_obj_t *create_sign_stroke(lv_obj_t *parent, int w, int h,
+                                     int x_ofs, int y_ofs)
+{
+    lv_obj_t *bar = lv_obj_create(parent);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, w, h);
+    lv_obj_set_style_bg_color(bar, COL_WHITE, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_align(bar, LV_ALIGN_CENTER, x_ofs, y_ofs);
+    obj_set_passive(bar);
+    return bar;
+}
+
+static lv_obj_t *build_sound_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = create_page_container(parent);
+
+    /* Outer circle outline (matches brightness detail) */
+    s_sound_outer = lv_obj_create(page);
+    lv_obj_remove_style_all(s_sound_outer);
+    lv_obj_set_size(s_sound_outer, BRIGHT_OUTER_DIAM, BRIGHT_OUTER_DIAM);
+    lv_obj_set_style_radius(s_sound_outer, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_sound_outer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_sound_outer, 1, 0);
+    lv_obj_set_style_border_color(s_sound_outer, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_opa(s_sound_outer, LV_OPA_COVER, 0);
+    lv_obj_align(s_sound_outer, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_sound_outer);
+
+    /* Magenta circle (transient volume feedback) */
+    s_sound_circle = lv_obj_create(page);
+    lv_obj_remove_style_all(s_sound_circle);
+    lv_obj_set_size(s_sound_circle, SOUND_BASE_DIAM, SOUND_BASE_DIAM);
+    lv_obj_set_style_radius(s_sound_circle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_sound_circle, lv_color_hex(PAGES[3].color), 0);
+    lv_obj_set_style_bg_opa(s_sound_circle, LV_OPA_COVER, 0);
+    lv_obj_align(s_sound_circle, LV_ALIGN_CENTER, 0, 0);
+    obj_set_passive(s_sound_circle);
+
+    /* Minus (left) and plus (right) */
+    s_sound_minus = create_sign_stroke(page, SOUND_SIGN_LEN, SOUND_SIGN_THICK,
+                                       SOUND_MINUS_X, 0);
+    s_sound_plus_h = create_sign_stroke(page, SOUND_SIGN_LEN, SOUND_SIGN_THICK,
+                                        SOUND_PLUS_X, 0);
+    s_sound_plus_v = create_sign_stroke(page, SOUND_SIGN_THICK, SOUND_SIGN_LEN,
+                                        SOUND_PLUS_X, 0);
+    return page;
+}
+
+/* --- Volume feedback: bump the circle, then settle back to base size ---
+ *
+ * Volume UP:   quick grow, then a slow shrink back to base.
+ * Volume DOWN: quick shrink, then (after an idle pause) grow back to base.
+ * The settle animation is chained from the bump so rapid steps keep
+ * re-bumping without fighting a running settle. */
+
+static int s_sound_step_dir = 0;
+
+static void sound_settle(uint32_t delay_ms, uint32_t dur_ms)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sound_circle);
+    lv_anim_set_values(&a, lv_obj_get_width(s_sound_circle), SOUND_BASE_DIAM);
+    lv_anim_set_exec_cb(&a, circle_size_cb);
+    lv_anim_set_delay(&a, delay_ms);
+    lv_anim_set_duration(&a, dur_ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void sound_bump_done_cb(lv_anim_t *a)
+{
+    if (s_sound_step_dir > 0)
+        sound_settle(250, 900);    /* slowly deflate after an up-bump */
+    else
+        sound_settle(600, 350);    /* recover to base once idle */
+}
+
+/* "Pressed" pulse on the +/- glyph: stroke shrinks a bit, then springs
+ * back (lv_anim playback).  Aligned objects re-center automatically. */
+
+static void sign_w_cb(void *obj, int32_t v) { lv_obj_set_width((lv_obj_t *)obj, v); }
+static void sign_h_cb(void *obj, int32_t v) { lv_obj_set_height((lv_obj_t *)obj, v); }
+
+static void sign_pulse(lv_obj_t *bar, bool vertical)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, bar);
+    lv_anim_set_values(&a, SOUND_SIGN_LEN, SOUND_SIGN_PRESSED);
+    lv_anim_set_exec_cb(&a, vertical ? sign_h_cb : sign_w_cb);
+    lv_anim_set_duration(&a, 90);
+    lv_anim_set_reverse_duration(&a, 250);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void sound_volume_step(int dir)
+{
+    const int64_t now = ui_clock_ms();
+    if (s_sound_last_step_ms != SOUND_NO_STEP && now - s_sound_last_step_ms < SOUND_STEP_MIN_MS)
+        return;                    /* visual bump == sent command, 1:1 */
+    s_sound_last_step_ms = now;
+    s_sound_step_dir = dir;
+
+    int cur = lv_obj_get_width(s_sound_circle);
+    int target = cur + dir * SOUND_STEP_PX;
+    if (target > SOUND_MAX_DIAM) target = SOUND_MAX_DIAM;
+    if (target < SOUND_MIN_DIAM) target = SOUND_MIN_DIAM;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sound_circle);
+    lv_anim_set_values(&a, cur, target);
+    lv_anim_set_exec_cb(&a, circle_size_cb);
+    lv_anim_set_duration(&a, 90);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_completed_cb(&a, sound_bump_done_cb);
+    lv_anim_start(&a);
+
+    if (dir > 0) {
+        sign_pulse(s_sound_plus_h, false);
+        sign_pulse(s_sound_plus_v, true);
+    } else {
+        sign_pulse(s_sound_minus, false);
+    }
+
+    notify_change(UI_EVT_VOLUME, dir);
+}
+
+/* ========================================================================== */
+/*  Fade transition (opacity animation on page containers)                    */
+/* ========================================================================== */
+
+static void fade_opa_cb(void *obj, int32_t value)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+static void hide_arc(void)
+{
+    lv_obj_set_hidden(s_menu_circle, true);
+    lv_obj_set_hidden(s_arc, true);
+}
+
+static void show_arc(void)
+{
+    lv_obj_set_hidden(s_menu_circle, false);
+    lv_obj_set_hidden(s_arc, false);
+}
+
+static lv_obj_t *s_fade_out_target = NULL;
+
+static void reset_children_opa(lv_obj_t *parent)
+{
+    uint32_t cnt = lv_obj_get_child_count(parent);
+    for (uint32_t i = 0; i < cnt; i++)
+        lv_obj_set_style_opa(lv_obj_get_child(parent, i), LV_OPA_COVER, 0);
+}
+
+static void hide_glow_for_page(lv_obj_t *page)
+{
+    for (int i = 0; i < SCREEN_COUNT; i++) {
+        if (s_pages[i] == page && s_glow[i]) {
+            lv_obj_set_hidden(s_glow[i], true);
+            lv_obj_set_style_opa(s_glow[i], LV_OPA_COVER, 0);
+        }
+    }
+}
+
+static void fade_out_done_cb(lv_anim_t *a)
+{
+    if (s_fade_out_target) {
+        lv_obj_set_hidden(s_fade_out_target, true);
+        reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
+        s_fade_out_target = NULL;
+    }
+}
+
+static void fade_in_done_cb(lv_anim_t *a)
+{
+    s_animating = false;
+}
+
+static void fade_children(lv_obj_t *parent, lv_opa_t from_opa, lv_opa_t to_opa,
+                          uint32_t dur_ms, lv_anim_completed_cb_t done_cb)
+{
+    uint32_t cnt = lv_obj_get_child_count(parent);
+    uint32_t visible_idx = 0;
+    uint32_t total_visible = 0;
+    for (uint32_t i = 0; i < cnt; i++)
+        if (!lv_obj_is_hidden(lv_obj_get_child(parent, i)))
+            total_visible++;
+
+    for (uint32_t i = 0; i < cnt; i++) {
+        lv_obj_t *child = lv_obj_get_child(parent, i);
+        if (lv_obj_is_hidden(child)) continue;
+        lv_obj_set_style_opa(child, from_opa, 0);
+        visible_idx++;
+
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, child);
+        lv_anim_set_values(&a, from_opa, to_opa);
+        lv_anim_set_exec_cb(&a, fade_opa_cb);
+        lv_anim_set_duration(&a, dur_ms);
+        if (done_cb && visible_idx == total_visible)
+            lv_anim_set_completed_cb(&a, done_cb);
+        lv_anim_start(&a);
+    }
+}
+
+static int glow_index_for_page(lv_obj_t *page)
+{
+    for (int i = 0; i < SCREEN_COUNT; i++)
+        if (s_pages[i] == page) return i;
+    return -1;
+}
+
+static void fade_glow(int idx, lv_opa_t from, lv_opa_t to, uint32_t dur_ms)
+{
+    if (idx < 0 || !s_glow[idx]) return;
+    lv_obj_set_style_opa(s_glow[idx], from, 0);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_glow[idx]);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_exec_cb(&a, fade_opa_cb);
+    lv_anim_set_duration(&a, dur_ms);
+    lv_anim_start(&a);
+}
+
+static void fade_transition(lv_obj_t *from, lv_obj_t *to)
+{
+    if (s_animating) return;
+    s_animating = true;
+
+    s_fade_out_target = from;
+
+    /* Fade out visible children of departing page + its glow */
+    fade_children(from, LV_OPA_COVER, LV_OPA_TRANSP, FADE_TIME_MS, fade_out_done_cb);
+    fade_glow(glow_index_for_page(from), LV_OPA_COVER, LV_OPA_TRANSP, FADE_TIME_MS);
+
+    /* Show arriving page + its glow, fade in */
+    lv_obj_set_style_opa(to, LV_OPA_COVER, 0);
+    lv_obj_set_hidden(to, false);
+    fade_children(to, LV_OPA_TRANSP, LV_OPA_COVER, FADE_TIME_MS, fade_in_done_cb);
+
+    int to_idx = glow_index_for_page(to);
+    if (to_idx >= 0 && s_glow[to_idx]) {
+        lv_obj_set_hidden(s_glow[to_idx], false);
+        fade_glow(to_idx, LV_OPA_TRANSP, LV_OPA_COVER, FADE_TIME_MS);
+    }
+}
+
+/* ========================================================================== */
+/*  Brightness transition: circle grows 308->456, yellow circle scales up,    */
+/*  text fades in, lights page fades out.                                     */
+/* ========================================================================== */
+
+#define BRIGHT_ANIM_MS 400
+
+static void circle_size_cb(void *obj, int32_t value)
+{
+    lv_obj_set_size((lv_obj_t *)obj, value, value);
+    lv_obj_center((lv_obj_t *)obj);
+}
+
+static void enter_bright_done_cb(lv_anim_t *a)
+{
+    if (s_fade_out_target) {
+        lv_obj_set_hidden(s_fade_out_target, true);
+        reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
+        s_fade_out_target = NULL;
+    }
+    s_animating = false;
+}
+
+static void exit_bright_done_cb(lv_anim_t *a)
+{
+    lv_obj_set_hidden(s_bright_page, true);
+    lv_obj_set_size(s_bright_outer, BRIGHT_OUTER_DIAM, BRIGHT_OUTER_DIAM);
+    lv_obj_center(s_bright_outer);
+    lv_obj_set_style_opa(s_bright_label, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_bright_hint, LV_OPA_COVER, 0);
+    update_brightness_display();
+    show_arc();
+    s_animating = false;
+}
+
+static void switch_page(int new_idx, int dir)
+{
+    if (new_idx < 0) new_idx = SCREEN_COUNT - 1;
+    if (new_idx >= SCREEN_COUNT) new_idx = 0;
+    if (new_idx == s_current) return;
+    if (s_animating) return;
+
+    fade_transition(s_pages[s_current], s_pages[new_idx]);
+
+    /* Rotate the arc to the new page's dot: CW for forward navigation,
+     * CCW for backward, crossfading between the page accent colors. */
+    int cw_delta = ((PAGES[new_idx].arc_deg - PAGES[s_current].arc_deg)
+                    % 360 + 360) % 360;
+    s_arc_from_deg = PAGES[s_current].arc_deg;
+    s_arc_delta_deg = (dir > 0) ? cw_delta : cw_delta - 360;
+    s_arc_from_color = lv_color_hex(PAGES[s_current].color);
+    s_arc_to_color = lv_color_hex(PAGES[new_idx].color);
+
+    lv_anim_t arc_anim;
+    lv_anim_init(&arc_anim);
+    lv_anim_set_var(&arc_anim, NULL);
+    lv_anim_set_values(&arc_anim, 0, 255);
+    lv_anim_set_exec_cb(&arc_anim, arc_rotate_anim_cb);
+    lv_anim_set_duration(&arc_anim, FADE_TIME_MS);
+    lv_anim_set_path_cb(&arc_anim, lv_anim_path_ease_in_out);
+    lv_anim_start(&arc_anim);
+
+    s_current = new_idx;
+}
+
+/* ========================================================================== */
+/*  Mode transitions                                                          */
+/* ========================================================================== */
+
+static void enter_brightness_mode(void)
+{
+    if (s_mode != UI_MODE_MENU || s_animating) return;
+    s_mode = UI_MODE_BRIGHTNESS;
+    s_animating = true;
+
+    s_detail_last_activity = ui_clock_ms();
+
+    if (s_brightness == 0) {
+        s_brightness = s_last_nonzero_brightness > 0 ? s_last_nonzero_brightness : 100;
+        notify_change(UI_EVT_BRIGHTNESS, s_brightness);
+    }
+
+    hide_arc();
+    update_brightness_display();
+
+    int target_diam = s_brightness > 0
+        ? BRIGHT_CIRCLE_MIN + (BRIGHT_CIRCLE_MAX - BRIGHT_CIRCLE_MIN) * s_brightness / 100
+        : 0;
+
+    /* Prepare brightness page children at their starting state */
+    lv_obj_set_size(s_bright_outer, CIRCLE_DIAM, CIRCLE_DIAM);
+    lv_obj_center(s_bright_outer);
+    if (target_diam > 0) {
+        lv_obj_set_hidden(s_bright_circle, false);
+        lv_obj_set_size(s_bright_circle, 1, 1);
+        lv_obj_center(s_bright_circle);
+    }
+    lv_obj_set_style_opa(s_bright_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_opa(s_bright_hint, LV_OPA_TRANSP, 0);
+
+    /* Show brightness page at full opacity (children control their own visibility) */
+    lv_obj_set_style_opa(s_bright_page, LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_bright_page, false);
+
+    s_fade_out_target = s_pages[s_current];
+
+    /* Anim 1: Fade out menu page children + glow */
+    fade_children(s_pages[s_current], LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_glow(glow_index_for_page(s_pages[s_current]), LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS);
+
+    /* Anim 2: Grow outer circle outline 308 -> 456 */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_bright_outer);
+    lv_anim_set_values(&a2, CIRCLE_DIAM, BRIGHT_OUTER_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_out);
+    lv_anim_start(&a2);
+
+    /* Anim 3: Grow yellow filled circle 1 -> target */
+    if (target_diam > 0) {
+        lv_anim_t a3;
+        lv_anim_init(&a3);
+        lv_anim_set_var(&a3, s_bright_circle);
+        lv_anim_set_values(&a3, 1, target_diam);
+        lv_anim_set_exec_cb(&a3, circle_size_cb);
+        lv_anim_set_duration(&a3, BRIGHT_ANIM_MS);
+        lv_anim_set_path_cb(&a3, lv_anim_path_ease_out);
+        lv_anim_start(&a3);
+    }
+
+    /* Anim 4: Fade in brightness number */
+    lv_anim_t a4;
+    lv_anim_init(&a4);
+    lv_anim_set_var(&a4, s_bright_label);
+    lv_anim_set_values(&a4, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_exec_cb(&a4, fade_opa_cb);
+    lv_anim_set_duration(&a4, BRIGHT_ANIM_MS);
+    lv_anim_start(&a4);
+
+    /* Anim 5: Fade in hint text (carries the done callback) */
+    lv_anim_t a5;
+    lv_anim_init(&a5);
+    lv_anim_set_var(&a5, s_bright_hint);
+    lv_anim_set_values(&a5, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_exec_cb(&a5, fade_opa_cb);
+    lv_anim_set_duration(&a5, BRIGHT_ANIM_MS);
+    lv_anim_set_completed_cb(&a5, enter_bright_done_cb);
+    lv_anim_start(&a5);
+
+    NEST_LOGI(TAG, "Entered brightness mode (brightness=%d)", s_brightness);
+}
+
+static void exit_brightness_mode(void)
+{
+    if (s_mode != UI_MODE_BRIGHTNESS || s_animating) return;
+    s_mode = UI_MODE_MENU;
+    s_animating = true;
+
+    int current_diam = s_brightness > 0
+        ? BRIGHT_CIRCLE_MIN + (BRIGHT_CIRCLE_MAX - BRIGHT_CIRCLE_MIN) * s_brightness / 100
+        : 1;
+
+    /* Show lights page underneath + its glow, fade in */
+    lv_obj_set_style_opa(s_pages[s_current], LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_pages[s_current], false);
+    fade_children(s_pages[s_current], LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    {
+        int gi = glow_index_for_page(s_pages[s_current]);
+        if (gi >= 0 && s_glow[gi]) {
+            lv_obj_set_hidden(s_glow[gi], false);
+            fade_glow(gi, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS);
+        }
+    }
+
+    /* Anim 2: Shrink outer circle 456 -> 308 */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_bright_outer);
+    lv_anim_set_values(&a2, BRIGHT_OUTER_DIAM, CIRCLE_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_in);
+    lv_anim_start(&a2);
+
+    /* Anim 3: Shrink yellow circle -> 1 */
+    lv_anim_t a3;
+    lv_anim_init(&a3);
+    lv_anim_set_var(&a3, s_bright_circle);
+    lv_anim_set_values(&a3, current_diam, 1);
+    lv_anim_set_exec_cb(&a3, circle_size_cb);
+    lv_anim_set_duration(&a3, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a3, lv_anim_path_ease_in);
+    lv_anim_start(&a3);
+
+    /* Anim 4: Fade out brightness number */
+    lv_anim_t a4;
+    lv_anim_init(&a4);
+    lv_anim_set_var(&a4, s_bright_label);
+    lv_anim_set_values(&a4, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_exec_cb(&a4, fade_opa_cb);
+    lv_anim_set_duration(&a4, BRIGHT_ANIM_MS);
+    lv_anim_start(&a4);
+
+    /* Anim 5: Fade out hint (carries done callback) */
+    lv_anim_t a5;
+    lv_anim_init(&a5);
+    lv_anim_set_var(&a5, s_bright_hint);
+    lv_anim_set_values(&a5, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_exec_cb(&a5, fade_opa_cb);
+    lv_anim_set_duration(&a5, BRIGHT_ANIM_MS);
+    lv_anim_set_completed_cb(&a5, exit_bright_done_cb);
+    lv_anim_start(&a5);
+
+    NEST_LOGI(TAG, "Exited brightness mode (brightness=%d)", s_brightness);
+}
+
+/* Fan transition: all 3 circles scale up proportionally from menu circle size */
+#define FAN_ANIM_MS 400
+static const int fan_diams[3] = {FAN_OUTER_DIAM, FAN_MID_DIAM, FAN_SMALL_DIAM};
+static const int fan_start_diams[3] = {
+    CIRCLE_DIAM,
+    FAN_MID_DIAM * CIRCLE_DIAM / FAN_OUTER_DIAM,
+    FAN_SMALL_DIAM * CIRCLE_DIAM / FAN_OUTER_DIAM,
+};
+
+static void enter_fan_done_cb(lv_anim_t *a)
+{
+    if (s_fade_out_target) {
+        lv_obj_set_hidden(s_fade_out_target, true);
+        reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
+        s_fade_out_target = NULL;
+    }
+    s_animating = false;
+}
+
+static void exit_fan_done_cb(lv_anim_t *a)
+{
+    lv_obj_set_hidden(s_fan_page, true);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_size(s_fan_circles[i], fan_diams[i], fan_diams[i]);
+        lv_obj_center(s_fan_circles[i]);
+    }
+    lv_obj_set_style_opa(s_fan_label, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_fan_hint, LV_OPA_COVER, 0);
+    update_fan_display();
+    show_arc();
+    s_animating = false;
+}
+
+static void enter_fan_mode(void)
+{
+    if (s_mode != UI_MODE_MENU || s_animating) return;
+    s_mode = UI_MODE_FAN;
+    s_animating = true;
+    s_fan_accum = 0;
+
+    s_detail_last_activity = ui_clock_ms();
+
+    hide_arc();
+    update_fan_display();
+
+    /* Set circles to starting sizes (proportional to menu circle) */
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_size(s_fan_circles[i], fan_start_diams[i], fan_start_diams[i]);
+        lv_obj_center(s_fan_circles[i]);
+    }
+    lv_obj_set_style_opa(s_fan_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_opa(s_fan_hint, LV_OPA_TRANSP, 0);
+
+    lv_obj_set_style_opa(s_fan_page, LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_fan_page, false);
+
+    s_fade_out_target = s_pages[s_current];
+
+    /* Fade out menu page children + glow */
+    fade_children(s_pages[s_current], LV_OPA_COVER, LV_OPA_TRANSP, FAN_ANIM_MS, NULL);
+    fade_glow(glow_index_for_page(s_pages[s_current]), LV_OPA_COVER, LV_OPA_TRANSP, FAN_ANIM_MS);
+
+    /* Grow all 3 circles from start to final size */
+    for (int i = 0; i < 3; i++) {
+        lv_anim_t ac;
+        lv_anim_init(&ac);
+        lv_anim_set_var(&ac, s_fan_circles[i]);
+        lv_anim_set_values(&ac, fan_start_diams[i], fan_diams[i]);
+        lv_anim_set_exec_cb(&ac, circle_size_cb);
+        lv_anim_set_duration(&ac, FAN_ANIM_MS);
+        lv_anim_set_path_cb(&ac, lv_anim_path_ease_out);
+        lv_anim_start(&ac);
+    }
+
+    /* Fade in fan label */
+    lv_anim_t a_lbl;
+    lv_anim_init(&a_lbl);
+    lv_anim_set_var(&a_lbl, s_fan_label);
+    lv_anim_set_values(&a_lbl, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_exec_cb(&a_lbl, fade_opa_cb);
+    lv_anim_set_duration(&a_lbl, FAN_ANIM_MS);
+    lv_anim_start(&a_lbl);
+
+    /* Fade in hint (carries done callback) */
+    lv_anim_t a_hint;
+    lv_anim_init(&a_hint);
+    lv_anim_set_var(&a_hint, s_fan_hint);
+    lv_anim_set_values(&a_hint, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_exec_cb(&a_hint, fade_opa_cb);
+    lv_anim_set_duration(&a_hint, FAN_ANIM_MS);
+    lv_anim_set_completed_cb(&a_hint, enter_fan_done_cb);
+    lv_anim_start(&a_hint);
+
+    NEST_LOGI(TAG, "Entered fan mode (level=%d)", s_fan_level);
+}
+
+static void exit_fan_mode(void)
+{
+    if (s_mode != UI_MODE_FAN || s_animating) return;
+    s_mode = UI_MODE_MENU;
+    s_animating = true;
+
+    /* Show menu page underneath + its glow, fade in */
+    lv_obj_set_style_opa(s_pages[s_current], LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_pages[s_current], false);
+    fade_children(s_pages[s_current], LV_OPA_TRANSP, LV_OPA_COVER, FAN_ANIM_MS, NULL);
+    {
+        int gi = glow_index_for_page(s_pages[s_current]);
+        if (gi >= 0 && s_glow[gi]) {
+            lv_obj_set_hidden(s_glow[gi], false);
+            fade_glow(gi, LV_OPA_TRANSP, LV_OPA_COVER, FAN_ANIM_MS);
+        }
+    }
+
+    /* Shrink all 3 circles back to start sizes */
+    for (int i = 0; i < 3; i++) {
+        lv_anim_t ac;
+        lv_anim_init(&ac);
+        lv_anim_set_var(&ac, s_fan_circles[i]);
+        lv_anim_set_values(&ac, fan_diams[i], fan_start_diams[i]);
+        lv_anim_set_exec_cb(&ac, circle_size_cb);
+        lv_anim_set_duration(&ac, FAN_ANIM_MS);
+        lv_anim_set_path_cb(&ac, lv_anim_path_ease_in);
+        lv_anim_start(&ac);
+    }
+
+    /* Fade out fan label */
+    lv_anim_t a_lbl;
+    lv_anim_init(&a_lbl);
+    lv_anim_set_var(&a_lbl, s_fan_label);
+    lv_anim_set_values(&a_lbl, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_exec_cb(&a_lbl, fade_opa_cb);
+    lv_anim_set_duration(&a_lbl, FAN_ANIM_MS);
+    lv_anim_start(&a_lbl);
+
+    /* Fade out hint (carries done callback) */
+    lv_anim_t a_hint;
+    lv_anim_init(&a_hint);
+    lv_anim_set_var(&a_hint, s_fan_hint);
+    lv_anim_set_values(&a_hint, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_exec_cb(&a_hint, fade_opa_cb);
+    lv_anim_set_duration(&a_hint, FAN_ANIM_MS);
+    lv_anim_set_completed_cb(&a_hint, exit_fan_done_cb);
+    lv_anim_start(&a_hint);
+
+    NEST_LOGI(TAG, "Exited fan mode (level=%d)", s_fan_level);
+}
+
+/* ========================================================================== */
+/*  Sound mode transitions (mirrors the brightness enter/exit choreography)   */
+/* ========================================================================== */
+
+static void enter_sound_done_cb(lv_anim_t *a)
+{
+    if (s_fade_out_target) {
+        lv_obj_set_hidden(s_fade_out_target, true);
+        reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
+        s_fade_out_target = NULL;
+    }
+    s_animating = false;
+}
+
+static void exit_sound_done_cb(lv_anim_t *a)
+{
+    lv_obj_set_hidden(s_sound_page, true);
+    lv_obj_set_size(s_sound_outer, BRIGHT_OUTER_DIAM, BRIGHT_OUTER_DIAM);
+    lv_obj_center(s_sound_outer);
+    lv_obj_set_size(s_sound_circle, SOUND_BASE_DIAM, SOUND_BASE_DIAM);
+    lv_obj_center(s_sound_circle);
+    lv_obj_set_style_opa(s_sound_minus, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_sound_plus_h, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_sound_plus_v, LV_OPA_COVER, 0);
+    lv_obj_set_size(s_sound_minus, SOUND_SIGN_LEN, SOUND_SIGN_THICK);
+    lv_obj_set_size(s_sound_plus_h, SOUND_SIGN_LEN, SOUND_SIGN_THICK);
+    lv_obj_set_size(s_sound_plus_v, SOUND_SIGN_THICK, SOUND_SIGN_LEN);
+    show_arc();
+    s_animating = false;
+}
+
+static void fade_obj(lv_obj_t *obj, lv_opa_t from, lv_opa_t to, uint32_t dur,
+                     lv_anim_completed_cb_t done_cb)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_exec_cb(&a, fade_opa_cb);
+    lv_anim_set_duration(&a, dur);
+    if (done_cb) lv_anim_set_completed_cb(&a, done_cb);
+    lv_anim_start(&a);
+}
+
+static void enter_sound_mode(void)
+{
+    if (s_mode != UI_MODE_MENU || s_animating) return;
+    s_mode = UI_MODE_SOUND;
+    s_animating = true;
+    s_sound_accum = 0;
+    s_sound_last_step_ms = SOUND_NO_STEP;
+
+    s_detail_last_activity = ui_clock_ms();
+
+    hide_arc();
+
+    /* Children at their starting state: outer at menu-circle size,
+     * magenta circle tiny, signs invisible */
+    lv_obj_set_size(s_sound_outer, CIRCLE_DIAM, CIRCLE_DIAM);
+    lv_obj_center(s_sound_outer);
+    lv_obj_set_size(s_sound_circle, 1, 1);
+    lv_obj_center(s_sound_circle);
+    lv_obj_set_style_opa(s_sound_minus, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_opa(s_sound_plus_h, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_opa(s_sound_plus_v, LV_OPA_TRANSP, 0);
+
+    lv_obj_set_style_opa(s_sound_page, LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_sound_page, false);
+
+    s_fade_out_target = s_pages[s_current];
+
+    /* Fade out menu page children + glow */
+    fade_children(s_pages[s_current], LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_glow(glow_index_for_page(s_pages[s_current]), LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS);
+
+    /* Grow outer outline 308 -> 456 */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_sound_outer);
+    lv_anim_set_values(&a2, CIRCLE_DIAM, BRIGHT_OUTER_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_out);
+    lv_anim_start(&a2);
+
+    /* Grow magenta circle 1 -> base */
+    lv_anim_t a3;
+    lv_anim_init(&a3);
+    lv_anim_set_var(&a3, s_sound_circle);
+    lv_anim_set_values(&a3, 1, SOUND_BASE_DIAM);
+    lv_anim_set_exec_cb(&a3, circle_size_cb);
+    lv_anim_set_duration(&a3, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a3, lv_anim_path_ease_out);
+    lv_anim_start(&a3);
+
+    /* Fade in the signs (last one carries the done callback) */
+    fade_obj(s_sound_minus, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_h, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_v, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, enter_sound_done_cb);
+
+    NEST_LOGI(TAG, "Entered sound mode");
+}
+
+static void exit_sound_mode(void)
+{
+    if (s_mode != UI_MODE_SOUND || s_animating) return;
+    s_mode = UI_MODE_MENU;
+    s_animating = true;
+
+    /* Stop any in-flight bump/settle/pulse animations */
+    lv_anim_delete(s_sound_circle, circle_size_cb);
+    lv_anim_delete(s_sound_minus, sign_w_cb);
+    lv_anim_delete(s_sound_plus_h, sign_w_cb);
+    lv_anim_delete(s_sound_plus_v, sign_h_cb);
+
+    /* Show menu page underneath + its glow, fade in */
+    lv_obj_set_style_opa(s_pages[s_current], LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_pages[s_current], false);
+    fade_children(s_pages[s_current], LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    {
+        int gi = glow_index_for_page(s_pages[s_current]);
+        if (gi >= 0 && s_glow[gi]) {
+            lv_obj_set_hidden(s_glow[gi], false);
+            fade_glow(gi, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS);
+        }
+    }
+
+    /* Shrink outer 456 -> 308 */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_sound_outer);
+    lv_anim_set_values(&a2, BRIGHT_OUTER_DIAM, CIRCLE_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_in);
+    lv_anim_start(&a2);
+
+    /* Shrink magenta circle -> 1 */
+    lv_anim_t a3;
+    lv_anim_init(&a3);
+    lv_anim_set_var(&a3, s_sound_circle);
+    lv_anim_set_values(&a3, lv_obj_get_width(s_sound_circle), 1);
+    lv_anim_set_exec_cb(&a3, circle_size_cb);
+    lv_anim_set_duration(&a3, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a3, lv_anim_path_ease_in);
+    lv_anim_start(&a3);
+
+    /* Fade out the signs (last one carries the done callback) */
+    fade_obj(s_sound_minus, LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_h, LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_obj(s_sound_plus_v, LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, exit_sound_done_cb);
+
+    NEST_LOGI(TAG, "Exited sound mode");
+}
+
+/* ========================================================================== */
+/*  Blinds mode transitions                                                   */
+/* ========================================================================== */
+
+static void enter_blinds_done_cb(lv_anim_t *a)
+{
+    if (s_fade_out_target) {
+        lv_obj_set_hidden(s_fade_out_target, true);
+        reset_children_opa(s_fade_out_target);
+        hide_glow_for_page(s_fade_out_target);
+        s_fade_out_target = NULL;
+    }
+    s_animating = false;
+}
+
+static void exit_blinds_done_cb(lv_anim_t *a)
+{
+    lv_obj_set_hidden(s_blinds_page, true);
+    lv_obj_set_size(s_blinds_outer, BLINDS_DIAM, BLINDS_DIAM);
+    lv_obj_center(s_blinds_outer);
+    reset_children_opa(s_blinds_page);
+    show_arc();
+    s_animating = false;
+}
+
+static void enter_blinds_mode(void)
+{
+    if (s_mode != UI_MODE_MENU || s_animating) return;
+    s_mode = UI_MODE_BLINDS;
+    s_animating = true;
+    s_blinds_accum = 0;
+
+    s_detail_last_activity = ui_clock_ms();
+
+    hide_arc();
+    blinds_update_labels();
+    blinds_show_pos(false);    /* selected target's position, no animation */
+
+    /* Outline starts at menu-circle size and grows to full */
+    lv_obj_set_size(s_blinds_outer, CIRCLE_DIAM, CIRCLE_DIAM);
+    lv_obj_center(s_blinds_outer);
+
+    lv_obj_set_style_opa(s_blinds_page, LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_blinds_page, false);
+
+    s_fade_out_target = s_pages[s_current];
+
+    /* Fade out menu page children + glow */
+    fade_children(s_pages[s_current], LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS, NULL);
+    fade_glow(glow_index_for_page(s_pages[s_current]), LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS);
+
+    /* Grow the outline 308 -> 462 */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_blinds_outer);
+    lv_anim_set_values(&a2, CIRCLE_DIAM, BLINDS_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_out);
+    lv_anim_start(&a2);
+
+    /* Fade in the blinds page children (clip + labels; cb on the last) */
+    fade_children(s_blinds_page, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS,
+                  enter_blinds_done_cb);
+
+    NEST_LOGI(TAG, "Entered blinds mode (sel=%d pos=%d/%d)",
+             s_blinds_sel, s_blinds_pos[0], s_blinds_pos[1]);
+}
+
+static void exit_blinds_mode(void)
+{
+    if (s_mode != UI_MODE_BLINDS || s_animating) return;
+    s_mode = UI_MODE_MENU;
+    s_animating = true;
+
+    lv_anim_delete(s_blinds_cover, blinds_cover_anim_cb);
+
+    /* Show menu page underneath + its glow, fade in */
+    lv_obj_set_style_opa(s_pages[s_current], LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_pages[s_current], false);
+    fade_children(s_pages[s_current], LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS, NULL);
+    {
+        int gi = glow_index_for_page(s_pages[s_current]);
+        if (gi >= 0 && s_glow[gi]) {
+            lv_obj_set_hidden(s_glow[gi], false);
+            fade_glow(gi, LV_OPA_TRANSP, LV_OPA_COVER, BRIGHT_ANIM_MS);
+        }
+    }
+
+    /* Shrink the outline back to menu size */
+    lv_anim_t a2;
+    lv_anim_init(&a2);
+    lv_anim_set_var(&a2, s_blinds_outer);
+    lv_anim_set_values(&a2, BLINDS_DIAM, CIRCLE_DIAM);
+    lv_anim_set_exec_cb(&a2, circle_size_cb);
+    lv_anim_set_duration(&a2, BRIGHT_ANIM_MS);
+    lv_anim_set_path_cb(&a2, lv_anim_path_ease_in);
+    lv_anim_start(&a2);
+
+    /* Fade out the blinds page children (cb on the last) */
+    fade_children(s_blinds_page, LV_OPA_COVER, LV_OPA_TRANSP, BRIGHT_ANIM_MS,
+                  exit_blinds_done_cb);
+
+    NEST_LOGI(TAG, "Exited blinds mode");
+}
+
+/* ========================================================================== */
+/*  Public API                                                                */
+/* ========================================================================== */
+
+void ui_init(void)
+{
+    NEST_C_ASSERT_UI_TASK();
+
+    /* Single screen -- never switched */
+    s_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_screen, COL_BLACK, 0);
+    lv_obj_set_style_bg_opa(s_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_screen, 0, 0);
+    lv_obj_set_scrollable(s_screen, false);
+    lv_obj_set_scrollbar_mode(s_screen, LV_SCROLLBAR_MODE_OFF);
+
+    /* Glow images (furthest back in z-order), one per page edge */
+    for (int i = 0; i < SCREEN_COUNT; i++)
+        s_glow[i] = create_image(s_screen, PAGES[i].glow, PAGES[i].glow_align, 0, 0);
+
+    /* Circle outline (behind pages so titles render in front) */
+    init_circle(s_screen);
+
+    /* Build menu pages (dots + titles, no glow) */
+    for (int i = 0; i < SCREEN_COUNT; i++)
+        s_pages[i] = build_menu_page(s_screen, i);
+
+    /* Arc indicator (on top of menu pages so it's visible over opaque glow images) */
+    init_arc(s_screen);
+
+    /* Build brightness detail page (initially hidden) */
+    s_bright_page = build_brightness_page(s_screen);
+    lv_obj_set_style_opa(s_bright_page, LV_OPA_TRANSP, 0);
+    lv_obj_set_hidden(s_bright_page, true);
+
+    /* Build fan detail page (initially hidden) */
+    s_fan_page = build_fan_detail_page(s_screen);
+    lv_obj_set_style_opa(s_fan_page, LV_OPA_TRANSP, 0);
+    lv_obj_set_hidden(s_fan_page, true);
+
+    /* Build sound detail page (initially hidden) */
+    s_sound_page = build_sound_page(s_screen);
+    lv_obj_set_style_opa(s_sound_page, LV_OPA_TRANSP, 0);
+    lv_obj_set_hidden(s_sound_page, true);
+
+    /* Build blinds detail page (initially hidden) */
+    s_blinds_page = build_blinds_page(s_screen);
+    lv_obj_set_style_opa(s_blinds_page, LV_OPA_TRANSP, 0);
+    lv_obj_set_hidden(s_blinds_page, true);
+
+    /* Start with page 0 visible, the rest hidden (glows follow their page) */
+    lv_obj_set_style_opa(s_pages[0], LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(s_glow[0], LV_OPA_COVER, 0);
+    for (int i = 1; i < SCREEN_COUNT; i++) {
+        lv_obj_set_style_opa(s_pages[i], LV_OPA_TRANSP, 0);
+        lv_obj_set_hidden(s_pages[i], true);
+        lv_obj_set_style_opa(s_glow[i], LV_OPA_TRANSP, 0);
+        lv_obj_set_hidden(s_glow[i], true);
+    }
+
+    /* Status label (on the screen itself, above everything) */
+    s_status_label = lv_label_create(s_screen);
+    lv_label_set_text(s_status_label, "");
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_status_label, 440);
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -38);
+
+    lv_screen_load(s_screen);
+    s_current = 0;
+    s_mode = UI_MODE_MENU;
+    s_animating = false;
+
+    NEST_LOGI(TAG, "UI initialized with %d pages + brightness/fan detail", SCREEN_COUNT);
+}
+
+void nest_ui_set_blinds_labels(const char *label_a, const char *label_b)
+{
+    if (label_a) s_blinds_label[0] = label_a;
+    if (label_b) s_blinds_label[1] = label_b;
+}
+
+void ui_set_status(const char *text)
+{
+    NEST_C_ASSERT_UI_TASK();
+
+    if (s_status_label)
+        lv_label_set_text(s_status_label, text);
+}
+
+void ui_encoder_navigate(int diff)
+{
+    NEST_C_ASSERT_UI_TASK();
+
+    if (diff == 0) return;
+
+    s_detail_last_activity = ui_clock_ms();
+
+    if (s_mode == UI_MODE_BRIGHTNESS) {
+        int brightness = s_brightness - diff * 2;
+        if (brightness < 0) brightness = 0;
+        if (brightness > 100) brightness = 100;
+        s_brightness = brightness;
+        if (brightness > 0) s_last_nonzero_brightness = brightness;
+        update_brightness_display();
+        notify_change(UI_EVT_BRIGHTNESS, brightness);
+    } else if (s_mode == UI_MODE_FAN) {
+        s_fan_accum -= diff;
+        if (s_fan_accum >= 3 || s_fan_accum <= -3) {
+            int level = s_fan_level + (s_fan_accum >= 3 ? 1 : -1);
+            if (level > 3) level = 3;
+            if (level < 0) level = 0;
+            s_fan_level = level;
+            s_fan_accum = 0;
+            if (level > 0) s_last_nonzero_fan = level;
+            update_fan_display();
+            notify_change(UI_EVT_FAN, level);
+        }
+    } else if (s_mode == UI_MODE_SOUND) {
+        /* CW (negative diff) = volume up, mirroring brightness */
+        s_sound_accum -= diff;
+        if (s_sound_accum >= SOUND_ACCUM_STEPS) {
+            s_sound_accum = 0;
+            sound_volume_step(+1);
+        } else if (s_sound_accum <= -SOUND_ACCUM_STEPS) {
+            s_sound_accum = 0;
+            sound_volume_step(-1);
+        }
+    } else if (s_mode == UI_MODE_BLINDS) {
+        /* CW (negative diff) = close (orange drops), CCW = open */
+        s_blinds_accum -= diff;
+        if (s_blinds_accum >= BLINDS_ACCUM_STEPS) {
+            s_blinds_accum = 0;
+            blinds_move(+1);
+        } else if (s_blinds_accum <= -BLINDS_ACCUM_STEPS) {
+            s_blinds_accum = 0;
+            blinds_move(-1);
+        }
+    } else {
+        /* Physical CW rotation = negative diff (same sign convention the
+         * brightness detail relies on).  CW advances to the next page so
+         * the active dot and arc travel clockwise with the knob. */
+        int step = (diff < 0) ? 1 : -1;
+        switch_page(s_current + step, step);
+    }
+}
+
+void ui_encoder_press(void)
+{
+    NEST_C_ASSERT_UI_TASK();
+
+    s_detail_last_activity = ui_clock_ms();
+
+    if (s_mode == UI_MODE_MENU) {
+        if (s_current == 0) {
+            enter_brightness_mode();
+        } else if (s_current == 1) {
+            enter_fan_mode();
+        } else if (s_current == 2) {
+            enter_blinds_mode();
+        } else if (s_current == 3) {
+            enter_sound_mode();
+        }
+    } else if (s_mode == UI_MODE_BRIGHTNESS) {
+        exit_brightness_mode();
+    } else if (s_mode == UI_MODE_FAN) {
+        exit_fan_mode();
+    } else if (s_mode == UI_MODE_SOUND) {
+        exit_sound_mode();
+    } else if (s_mode == UI_MODE_BLINDS) {
+        /* Short press switches the controlled blind; exit is long press
+         * or the idle timeout. */
+        blinds_toggle_sel();
+    }
+}
+
+static void toggle_light(void)
+{
+    const int brightness = s_brightness == 0
+        ? (s_last_nonzero_brightness > 0 ? s_last_nonzero_brightness : 100)
+        : 0;
+    s_brightness = brightness;
+    update_brightness_display();
+    notify_change(UI_EVT_BRIGHTNESS, brightness);
+    NEST_LOGI(TAG, "Long press: light toggled to %d%%", brightness);
+}
+
+static void toggle_fan(void)
+{
+    int level = s_fan_level;
+    if (level == 0) {
+        level = s_last_nonzero_fan;
+    } else {
+        s_last_nonzero_fan = level;
+        level = 0;
+    }
+    s_fan_level = level;
+    update_fan_display();
+    notify_change(UI_EVT_FAN, level);
+    NEST_LOGI(TAG, "Long press: fan toggled to %s", fan_level_names[level]);
+}
+
+void ui_encoder_long_press(void)
+{
+    NEST_C_ASSERT_UI_TASK();
+
+    s_detail_last_activity = ui_clock_ms();
+
+    if (s_mode == UI_MODE_MENU) {
+        /* Toggle the entity of the currently shown menu page without
+         * entering its detail screen (Blinds/Sound have no entity yet).
+         * The LED ring flashes as feedback: there is no on-screen change
+         * in the menu, so this is the only confirmation. */
+        if (s_current == 0) {
+            toggle_light();
+            ui_led_feedback(s_brightness > 0);
+        } else if (s_current == 1) {
+            toggle_fan();
+            ui_led_feedback(s_fan_level > 0);
+        }
+    } else if (s_mode == UI_MODE_BRIGHTNESS) {
+        toggle_light();
+        exit_brightness_mode();
+    } else if (s_mode == UI_MODE_FAN) {
+        toggle_fan();
+        exit_fan_mode();
+    } else if (s_mode == UI_MODE_BLINDS) {
+        /* Short press is taken by target selection, so long press exits */
+        exit_blinds_mode();
+    }
+}
+
+int ui_get_current_page(void)
+{
+    return s_current;
+}
+
+bool ui_is_detail_mode(void)
+{
+    return s_mode != UI_MODE_MENU;
+}
+
+int ui_get_brightness(void)
+{
+    return s_brightness;
+}
+
+int ui_get_fan_level(void)
+{
+    return s_fan_level;
+}
+
+void ui_set_brightness(int brightness)
+{
+    if (brightness < 0) brightness = 0;
+    if (brightness > 100) brightness = 100;
+    s_pending_brightness = brightness;
+}
+
+void ui_set_fan_level(int level)
+{
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    s_pending_fan = level;
+}
+
+void ui_set_blinds_pos(int target, int step)
+{
+    if (target < 0 || target > 1) return;
+    if (step < 0) step = 0;
+    if (step > BLINDS_POS_MAX) step = BLINDS_POS_MAX;
+    s_pending_blinds[target] = step;
+}
+
+void ui_process_pending(void)
+{
+    NEST_C_ASSERT_UI_TASK();
+
+    /* Values from outside are applied WITHOUT notify_change(): publishing
+     * them back would echo MQTT state to MQTT (the anti-loop rule). */
+    const int br = atomic_exchange(&s_pending_brightness, -1);
+    if (br >= 0 && br != s_brightness) {
+        s_brightness = br;
+        if (br > 0) s_last_nonzero_brightness = br;
+        if (s_mode == UI_MODE_BRIGHTNESS) update_brightness_display();
+    }
+
+    const int fan = atomic_exchange(&s_pending_fan, -1);
+    if (fan >= 0 && fan != s_fan_level) {
+        s_fan_level = fan;
+        if (fan > 0) s_last_nonzero_fan = fan;
+        if (s_mode == UI_MODE_FAN) update_fan_display();
+    }
+
+    for (int t = 0; t < 2; t++) {
+        const int step = atomic_exchange(&s_pending_blinds[t], -1);
+        if (step >= 0 && step != s_blinds_pos[t]) {
+            s_blinds_pos[t] = step;
+            if (s_mode == UI_MODE_BLINDS && s_blinds_sel == t)
+                blinds_show_pos(true);
+        }
+    }
+
+    if (!s_animating && ui_clock_ms() - s_detail_last_activity >= DETAIL_IDLE_TIMEOUT_MS) {
+        if (s_mode != UI_MODE_MENU) {
+            NEST_LOGI(TAG, "Detail screen idle timeout, returning to menu");
+            if (s_mode == UI_MODE_BRIGHTNESS)
+                exit_brightness_mode();
+            else if (s_mode == UI_MODE_FAN)
+                exit_fan_mode();
+            else if (s_mode == UI_MODE_SOUND)
+                exit_sound_mode();
+            else if (s_mode == UI_MODE_BLINDS)
+                exit_blinds_mode();
+            /* once the exit animation finishes, the branch below brings
+             * the menu back to the default Lights page */
+        } else if (s_current != 0) {
+            NEST_LOGI(TAG, "Menu idle timeout, returning to Lights");
+            switch_page(0, s_current >= 2 ? 1 : -1);
+        }
+    }
+}
+
+void ui_register_change_cb(ui_change_cb_t cb)
+{
+    s_change_cb = cb;
+}

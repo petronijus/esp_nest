@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The partition table is pinned by sha256 (the esp_nest partition guard in
+# esphome/esp-nest-components/esp_nest/__init__.py): keep it LF on every
+# checkout, including Git for Windows with core.autocrlf=true.
+/partitions.csv text eol=lf

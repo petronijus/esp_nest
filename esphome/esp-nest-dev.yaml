@@ -1,0 +1,14 @@
+# ESP Nest — local development entry point.
+#
+# The real substitutions (external MQTT topics, blinds groups and labels)
+# live in the private overlay (private/esphome/substitutions.yaml, a clone
+# of esp_nest-private); top-level substitutions override the package
+# defaults. Secrets come from the gitignored esphome/secrets.yaml, written
+# by scripts/secrets-decrypt.sh.
+#
+#   esphome compile esphome/esp-nest-dev.yaml
+
+substitutions: !include ../private/esphome/substitutions.yaml
+
+packages:
+  esp_nest: !include esp-nest.yaml

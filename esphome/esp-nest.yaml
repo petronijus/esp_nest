@@ -1,0 +1,191 @@
+# ESP Nest — the ESPHome package.
+#
+# Complete device configuration with generic defaults. It is consumed three
+# ways:
+#   - HA Device Builder: a remote package pinned to a release tag, see
+#     example-device.yaml (secrets from HA's secrets.yaml);
+#   - local development: esp-nest-dev.yaml (private substitutions, secrets
+#     from the gitignored esphome/secrets.yaml);
+#   - the local gate: this file directly, with dummy secrets.
+#
+# ESPHome owns the platform (WiFi, native API, OTA, safe mode, web server,
+# diagnostic entities); the esp_nest external component owns the display,
+# the UI and the device logic. Architecture: docs/esphome-migration-plan.md.
+#
+# Paths below (partitions, version, components) are relative to this file
+# and resolve inside a remote-package clone as well as in the working tree.
+
+substitutions:
+  name: esp-nest
+  friendly_name: ESP Nest
+  # External devices on the MQTT broker (the defaults are generic; the real
+  # topics come from the private overlay or the HA device YAML). Same names
+  # and defaults as the native firmware's Kconfig TOPIC_* options.
+  topic_lights: zigbee2mqtt/lights
+  topic_fan: home/fan
+  topic_stereo_vol: home/stereo/volume
+  # Blinds: the ESPHome RF cover bridge's topic prefix and its two group ids.
+  topic_blinds_prefix: blinds/cover
+  blinds_group_a: group_a
+  blinds_group_b: group_b
+  # On-screen labels of the two blinds groups. Every character must have a
+  # glyph in the label font (printable ASCII and ÁÉÍÓÚÝŠŽáéíóúýšž); the
+  # esp_nest component rejects any other.
+  blinds_label_a: "A"
+  blinds_label_b: "B"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.9.1
+  project:
+    name: petronijus.esp_nest
+    # Single version source; the esp_nest component refuses a mismatch.
+    version: !include ../version.txt
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  flash_mode: qio
+  cpu_frequency: 240MHz
+  # The native firmware's table, byte-identical: the device keeps it and OTA
+  # cannot change it. Guarded by sha256 in the esp_nest component.
+  partitions: ../partitions.csv
+  framework:
+    type: esp-idf
+    advanced:
+      compiler_optimization: PERF
+    sdkconfig_options:
+      # Display throughput (hardware-verified spike, esphome/README.md).
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: y
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: y
+      CONFIG_SPIRAM_XIP_FROM_PSRAM: y
+      CONFIG_LCD_RGB_ISR_IRAM_SAFE: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+  encryption:
+    key: !secret esp_nest_api_key
+  # Native never reboots because Home Assistant is unreachable.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:
+      key: !secret esp_nest_api_key
+  # POST /update accepts any app image: the way back to the native firmware
+  # (curl -u <user>:<password> -F firmware=@<app>.bin http://<ip>/update).
+  - platform: web_server
+
+web_server:
+  port: 80
+  local: true
+  auth:
+    type: basic
+    username: !secret esp_nest_web_username
+    password: !secret esp_nest_web_password
+
+safe_mode:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  # Fallback AP only after a long outage, so a router reboot reconnects at
+  # native speed. With an AP configured, WiFi loss never reboots the device.
+  ap:
+    ssid: ESP Nest Fallback
+    password: !secret esp_nest_fallback_password
+    ap_timeout: 10min
+
+captive_portal:
+
+# MQTT client for the external devices only (zigbee2mqtt lights, fan, stereo
+# volume, blinds): the knob's own entities use the native API. Configured
+# silent: no topic prefix (so no birth / will / shutdown / log topics, and
+# every entity's MQTT twin is internal), no discovery, no IP discovery.
+mqtt:
+  # Host name or IP address only, no mqtt:// and no port (1883).
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  topic_prefix: null
+  discovery: false
+  discover_ip: false
+  # Native never reboots because the broker is unreachable.
+  reboot_timeout: 0s
+  clean_session: true
+  # A stalled socket blocks the esp-mqtt task, not the loop. The only
+  # producer is loopTask (the single-producer contract of this mode).
+  idf_send_async: true
+
+external_components:
+  # Local directory next to this file. The distinctive name keeps a
+  # /config/esphome/<same name> folder in Home Assistant from shadowing it.
+  - source:
+      type: local
+      path: esp-nest-components
+    components: [esp_nest]
+
+esp_nest:
+  display:
+    hw_mirror_x: true
+  # The settings entities (native: the four HA config entities) exist with
+  # no configuration here: Screen Brightness 1-100 % (initial 100), Dim
+  # Brightness 0-100 % (20), Idle Timeout 0-600 s (30), LED Ring (ALWAYS_ON).
+  # Like native they are RAM-only; to keep one across reboots add
+  # `restore_value: true` to its key (screen_brightness, dim_brightness,
+  # idle_timeout) or set `restore_mode: RESTORE_DEFAULT_ON` on `led_ring`.
+  topics:
+    lights: ${topic_lights}
+    fan: ${topic_fan}
+    stereo_volume: ${topic_stereo_vol}
+  blinds:
+    prefix: ${topic_blinds_prefix}
+    group_a:
+      topic_id: ${blinds_group_a}
+      label: ${blinds_label_a}
+    group_b:
+      topic_id: ${blinds_group_b}
+      label: ${blinds_label_b}
+
+# Diagnostic entities (native: the 10 s telemetry of v2.0.1).
+sensor:
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 10s
+    entity_category: diagnostic
+  - platform: uptime
+    name: Uptime
+    type: seconds
+    update_interval: 10s
+    icon: mdi:timer-outline
+    entity_category: diagnostic
+  - platform: template
+    name: Free Heap
+    # KB including PSRAM, truncated like native.
+    lambda: return esp_get_free_heap_size() / 1024;
+    unit_of_measurement: KB
+    accuracy_decimals: 0
+    update_interval: 10s
+    icon: mdi:memory
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+      icon: mdi:ip-network
+      entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: Restart
+    icon: mdi:restart
+    entity_category: config

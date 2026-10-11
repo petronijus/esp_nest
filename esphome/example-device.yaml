@@ -1,0 +1,20 @@
+# ESP Nest — Home Assistant Device Builder configuration.
+#
+# Paste this into the Device Builder as the device's YAML. The package is
+# pinned to an immutable release tag, never a branch: bump the tag to
+# update. Secrets come from Home Assistant's secrets.yaml; their names are
+# listed in secrets.example.yaml. scripts/check.sh (smoke step) validates
+# this file with the package taken from a git clone of the tree.
+
+substitutions:
+  name: esp-nest
+  friendly_name: ESP Nest
+  # On-screen labels of the two blinds groups (the package default is
+  # "A" / "B"). Every character must have a glyph in the label font:
+  # printable ASCII and ÁÉÍÓÚÝŠŽáéíóúýšž (no ČĎĚŇŘŤŮ), no leading or
+  # trailing spaces; the esp_nest component rejects anything else.
+  # blinds_label_a: "Living"
+  # blinds_label_b: "Bedroom"
+
+packages:
+  esp_nest: github://petronijus/esp_nest/esphome/esp-nest.yaml@v3.0.0

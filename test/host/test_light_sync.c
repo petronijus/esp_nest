@@ -1,5 +1,6 @@
 /*
- * Host-side tests for the light_sync state machine (main/light_sync.c).
+ * Host-side tests for the light_sync state machine
+ * (esphome/esp-nest-components/esp_nest/light_sync.c).
  *
  * Build & run:  make -C test/host run
  *
@@ -9,31 +10,8 @@
  * external OFF with unchanged stored brightness).
  */
 
-#include <stdio.h>
+#include "check.h"
 #include "light_sync.h"
-
-static int g_checks = 0;
-static int g_failures = 0;
-
-#define CHECK(cond) do {                                              \
-    g_checks++;                                                       \
-    if (!(cond)) {                                                    \
-        printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);      \
-        g_failures++;                                                 \
-    }                                                                 \
-} while (0)
-
-#define CHECK_EQ(a, b) do {                                           \
-    g_checks++;                                                       \
-    long long _a = (long long)(a), _b = (long long)(b);               \
-    if (_a != _b) {                                                   \
-        printf("  FAIL %s:%d: %s == %s (%lld != %lld)\n",             \
-               __FILE__, __LINE__, #a, #b, _a, _b);                   \
-        g_failures++;                                                 \
-    }                                                                 \
-} while (0)
-
-#define SCENARIO(name) printf("--- %s\n", name)
 
 /* Shorthand: incoming Z2M state message {"state":..., "brightness":...} */
 static int msg(light_sync_t *ls, int64_t now, const char *state, int raw, int current)
@@ -241,6 +219,64 @@ static void test_no_resync_without_publish(void)
         CHECK_EQ(light_sync_tick(&ls, t, &out), LIGHT_SYNC_ACT_NONE);
 }
 
+static void test_time_base_crosses_2_pow_32(void)
+{
+    SCENARIO("time base: throttle, window, resync and apply across now = 2^32 ms (49.7 days)");
+    /* The ESPHome bridge feeds int64 millis_64(); a uint32 millis() would
+     * wrap here. Every interval below straddles or lands just past 2^32. */
+    const int64_t wrap = (int64_t)1 << 32;
+    const int64_t t0 = wrap - 1000;
+    light_sync_t ls;
+    light_sync_init(&ls);
+    int out = -1;
+
+    /* Throttle well before the boundary */
+    CHECK_EQ(light_sync_on_local_change(&ls, t0, 30), LIGHT_SYNC_ACT_PUBLISH);
+    CHECK_EQ(light_sync_on_local_change(&ls, t0 + 100, 34), LIGHT_SYNC_ACT_NONE);
+    CHECK_EQ(light_sync_tick(&ls, t0 + 299, &out), LIGHT_SYNC_ACT_NONE);
+    CHECK_EQ(light_sync_tick(&ls, t0 + 300, &out), LIGHT_SYNC_ACT_PUBLISH);
+    CHECK_EQ(out, 34);
+
+    /* Publish 100 ms before 2^32, queue a change exactly at 2^32: the
+     * 300 ms throttle spans the boundary and flushes at 2^32 + 200. */
+    CHECK(t0 + 900 < wrap && t0 + 1200 > wrap);
+    CHECK_EQ(light_sync_on_local_change(&ls, t0 + 900, 38), LIGHT_SYNC_ACT_PUBLISH);
+
+    /* The window opened at 2^32 - 100 ends past 2^32. Just before the
+     * boundary it must still be closed to state messages and must not emit
+     * an early /get (a truncated uint32 window end would read as elapsed). */
+    CHECK_EQ(msg(&ls, wrap - 50, "OFF", 0, 38), -1);
+    CHECK_EQ(light_sync_tick(&ls, wrap - 50, &out), LIGHT_SYNC_ACT_NONE);
+
+    CHECK_EQ(light_sync_on_local_change(&ls, wrap, 42), LIGHT_SYNC_ACT_NONE);
+    CHECK_EQ(light_sync_tick(&ls, wrap + 199, &out), LIGHT_SYNC_ACT_NONE);
+    CHECK_EQ(light_sync_tick(&ls, wrap + 200, &out), LIGHT_SYNC_ACT_PUBLISH);
+    CHECK_EQ(out, 42);
+
+    /* Authority window: 1500 ms from the last publish (2^32 + 200), so it
+     * closes at 2^32 + 1700. Everything inside it is dropped — an external
+     * OFF and a stale echo on the window's last millisecond alike. */
+    CHECK_EQ(msg(&ls, wrap + 500,  "OFF", 0, 42), -1);
+    CHECK_EQ(msg(&ls, wrap + 1699, "ON", light_sync_pct_to_raw(30), 42), -1);
+
+    /* Exactly one /get when the window closes */
+    CHECK_EQ(light_sync_tick(&ls, wrap + 1699, &out), LIGHT_SYNC_ACT_NONE);
+    CHECK_EQ(light_sync_tick(&ls, wrap + 1700, &out), LIGHT_SYNC_ACT_RESYNC);
+    CHECK_EQ(light_sync_tick(&ls, wrap + 1800, &out), LIGHT_SYNC_ACT_NONE);
+
+    /* Resync answer is applied unconditionally; OFF wins over the stored
+     * brightness (raw of the 42 % we published). */
+    CHECK_EQ(light_sync_pct_to_raw(42), 107);
+    CHECK_EQ(msg(&ls, wrap + 1900, "OFF", light_sync_pct_to_raw(42), 42), 0);
+
+    /* Idle past the boundary: no spurious publishes or /get requests */
+    for (int64_t t = wrap + 2000; t < wrap + 12000; t += 100)
+        CHECK_EQ(light_sync_tick(&ls, t, &out), LIGHT_SYNC_ACT_NONE);
+
+    /* Throttle state survived the boundary: a fresh change publishes */
+    CHECK_EQ(light_sync_on_local_change(&ls, wrap + 12000, 60), LIGHT_SYNC_ACT_PUBLISH);
+}
+
 /* ====================================================================== */
 
 int main(void)
@@ -257,7 +293,7 @@ int main(void)
     test_device_quantization_no_oscillation();
     test_initial_retained_state();
     test_no_resync_without_publish();
+    test_time_base_crosses_2_pow_32();
 
-    printf("\n%d checks, %d failures\n", g_checks, g_failures);
-    return g_failures ? 1 : 0;
+    return CHECK_SUMMARY();
 }

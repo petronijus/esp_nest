@@ -13,4 +13,4 @@ artifacts:
 registry:
   images: []
 preflight_extra:
-  - make -C test/host run
+  - scripts/check.sh
