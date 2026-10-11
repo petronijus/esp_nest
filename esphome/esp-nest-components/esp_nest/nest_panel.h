@@ -34,6 +34,8 @@ static constexpr int32_t PANEL_V_RES = 480;
 esp_err_t panel_init(bool hw_mirror_x);
 
 /// LVGL flush callback (RGB565 partial area -> rotated framebuffer).
+/// Microseconds spent in panel_flush_cb since the last call (nest_ui only).
+int64_t panel_take_flush_time_us();
 void panel_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map);
 
 }  // namespace esphome::esp_nest

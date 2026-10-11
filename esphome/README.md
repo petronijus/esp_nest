@@ -14,6 +14,7 @@ decisions and the step plan are in
 | `esp-nest.yaml` | The package: complete configuration with generic substitution defaults. |
 | `esp-nest-dev.yaml` | Local entry point: private substitutions + the package. |
 | `example-device.yaml` | What goes into the Home Assistant Device Builder (remote package pinned to a release tag). |
+| `esp-nest-bench.yaml` | Development only: the dev build in render-benchmark mode (the menu pages itself). Never leave it on the device. |
 | `secrets.example.yaml` | The secret names (never values). |
 | `esp-nest-components/esp_nest/` | The external component. Flat on purpose: ESPHome compiles only top-level sources. |
 
@@ -23,10 +24,10 @@ Component modules so far:
 |---|---|---|
 | `__init__.py` | — | Schema (display, blinds labels), partition, version and label-glyph guards, IDF components, LVGL 9.6 Kconfig. |
 | `nest_core` | loopTask | `EspNest` component: records the loop task, starts `nest_ui` and `nest_led`, reports their start-up (and the LED strip write errors, and once the `nest_led` stack high-water mark), drains the UI event queue (UI → loop, FreeRTOS queue of 64, drops counted and logged); task-ownership assertion macros. |
-| `nest_ui_task` | nest_ui | LVGL lifecycle and loop (core 1, prio 5, 16 KB internal stack): `ui_process_pending()` then `lv_timer_handler()`; draw buffers, LVGL allocator and log forwarding. |
+| `nest_ui_task` | nest_ui | LVGL lifecycle and loop (core 1, prio 5, 16 KB internal stack): `ui_process_pending()` then `lv_timer_handler()`; one 80-line draw buffer, LVGL allocator and log forwarding; DEBUG render statistics while the screen is being redrawn, and the optional render benchmark (see *Rendering performance*). |
 | `nest_ui.c` | nest_ui (+ atomic getters / pending setters from any task) | The UI: port of `main/ui.c` to LVGL 9.6 (four menu pages, brightness / fan / blinds / sound detail screens). Cross-task state is C11 atomics; values from outside are applied without a change notification (anti-loop rule). |
 | `nest_input` | nest_ui | Encoder (PCNT, accumulating across the 16-bit hardware range) + button (raw GPIO 3); LVGL indev read every 33 ms (native cadence) → `input_fsm` → `ui_encoder_*` + `backlight_update`. |
-| `nest_panel` | nest_ui | ST7701S init over 9-bit SPI (software reset + explicit SDIR), RGB panel, 180° flush. |
+| `nest_panel` | nest_ui | ST7701S init over 9-bit SPI (software reset + explicit SDIR), RGB panel (one PSRAM framebuffer, 10-line bounce buffers), 180° flush (timed for the render statistics). |
 | `nest_backlight` | nest_ui | LEDC PWM + fade, driven by `backlight_policy`. |
 | `nest_led_ring` | nest_led | 13× WS2812 on GPIO 4 via `espressif/led_strip` 3.0.3 (RMT 10 MHz, no DMA); task on core 0 (prio 3, 3 KB), which creates the strip so the RMT interrupt stays on core 0 as in native. `main/led_ring.c` logic: 20 ms tick, 3 s breathing at 5–45 % in the page colour, Lights detail tracks the brightness, 600 ms long-press feedback (swell on / double blink off). Inputs are atomics only: the UI's page / detail / brightness, the enabled flag, and the feedback word written by the UI's `ui_led_feedback()` hook (implemented here). Never logs; `nest_core` reports for it. |
 | `nest_c.h` | caller's | The component's C interface, implemented in `nest_core`. `NEST_LOGE/W/I/D` log through the ESPHome logger and are gated at compile time by `ESPHOME_LOG_LEVEL` (the `logger:` level), the same as the C++ `ESP_LOGx`. C files must use them and never IDF's `ESP_LOGx`: in a `.c` file those go to the IDF log, whose level (`esp32: framework: log_level`, default ERROR) compiles out everything below an error. Also `NEST_C_ASSERT_UI_TASK()` / `nest_on_ui_task()`, the C form of the UI-task assertion. |
@@ -190,3 +191,54 @@ default priority. `esp_nest` changes both on review findings: LVGL allocates
 from PSRAM first (ESPHome's `malloc` is internal-only) and its draw threads
 run at priority 1 so they cannot starve loopTask. Step 13 of the plan
 re-measures fps and memory with the real UI.
+
+## Rendering performance (2026-10-11)
+
+The spike's 35 fps came from a synthetic scene. The real UI measured far
+slower on the first ESPHome build, so the page transition — the animation
+that redraws almost the whole screen — was benchmarked on the device and
+tuned.
+
+**Method.** `esp-nest-bench.yaml` is the dev build with `esp_nest:
+display: benchmark: true`: the UI pages through the menu every 1.5 s on its
+own and logs, at DEBUG, one `Render:` line per 2 s window while the screen
+is being redrawn (frames, average and maximum refresh time, time spent in
+the flush copy, free internal RAM). Every variant below was flashed and
+measured for 18 windows. The benchmark build must never stay on the device.
+
+```bash
+esphome compile esphome/esp-nest-bench.yaml
+esphome upload  esphome/esp-nest-bench.yaml --device <ip>
+esphome logs    esphome/esp-nest-bench.yaml --device <ip>   # "Render:" lines
+```
+
+| Variant | Refresh per transition frame |
+|---|---|
+| First migrated build (2 draw units, 2×40-line buffers) | 68 ms |
+| One draw unit | 62 ms |
+| Single 80-line draw buffer (internal RAM) | 52 ms |
+| + 140 px fonts as static A8 (`tools/font_a8.py`, pixel-identical) | **45.5 ms (shipped)** |
+
+Kept: one 80-line buffer, static A8 fonts, two draw units (on par with one
+at this buffer size), bounce buffers on.
+
+Measured and rejected:
+
+| Experiment | Result |
+|---|---|
+| Draw threads at priority 3 / LVGL heap in internal RAM | no change (68 / 66 ms) |
+| Code and rodata from flash instead of PSRAM (XIP off) | slower (79 ms) |
+| 240-line draw buffer in PSRAM | slower (73 ms) |
+| LVGL without OS (no draw threads) | slower (43 vs 40 ms) |
+| Flush on a core-0 worker with 2×40 / 2×60 buffers | 51 / 41 ms, 2×60 leaves 19 KB internal RAM |
+| No bounce buffers | −3 ms, but the picture sits a few pixels off centre |
+| No bounce buffers + `CONFIG_LCD_RGB_RESTART_IN_VSYNC` | −4 ms, but the picture shakes during animation |
+| Glows as A8 masks recoloured at draw time | −3 ms, but visible banding: LVGL mixes a mask in 32 steps, the RGB565 glow has 64 levels of green |
+| ESP32-S3 PIE (SIMD) kernels for the RGB565 image-with-opacity and colour-through-mask blends, bit-exact with LVGL (self-tested on the device) | −0.5 ms: LVGL 9.6's packed C blend is already about as fast; half the glow blend is waiting on PSRAM reads of the image |
+
+An LVGL profiler pass showed where the remaining time goes: about three
+quarters of a frame is `execute_drawing` (roughly 62 draw tasks per frame:
+glyph and anti-aliased-edge masks, image setup, blending), about 10 ms is
+the copy into the PSRAM framebuffer, and walking the object tree is
+negligible. Removing every masked/image blend altogether would only bring a
+frame to ~34 ms, which bounds what any blend acceleration can gain.

@@ -6,6 +6,7 @@
 #include "esp_check.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
+#include "esp_timer.h"
 #include "esphome/core/log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -214,7 +215,17 @@ esp_err_t panel_init(bool hw_mirror_x) {
   return ESP_OK;
 }
 
+/// Time spent copying rendered areas into the framebuffer (nest_ui only).
+static int64_t s_flush_time_us = 0;
+
+int64_t panel_take_flush_time_us() {
+  const int64_t t = s_flush_time_us;
+  s_flush_time_us = 0;
+  return t;
+}
+
 void panel_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+  const int64_t start_us = esp_timer_get_time();
   const int32_t w = lv_area_get_width(area);
   const int32_t h = lv_area_get_height(area);
   const auto *src = reinterpret_cast<const uint16_t *>(px_map);
@@ -230,6 +241,7 @@ void panel_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) 
         dst_row[dst_x - x] = src_row[x];
     }
   }
+  s_flush_time_us += esp_timer_get_time() - start_us;
   lv_display_flush_ready(disp);
 }
 

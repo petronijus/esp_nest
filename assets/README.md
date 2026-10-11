@@ -60,7 +60,22 @@ uv run --with fonttools python3 -c \
 npx --yes lv_font_conv@1.5.3 --bpp 4 --size 140 --font "$CAMBRIA" \
   --range 0x42,0x46,0x4C,0x53,0x64,0x67-0x69,0x6C,0x6E,0x6F,0x73-0x75 \
   --format lvgl --no-compress -o $OUT/font_cambria_140.c --lv-include lvgl.h
+
+# Expand the 4-bpp glyphs to static A8 (pixel-identical, see below).
+python3 tools/font_a8.py $OUT/font_helvetica_100.c $OUT/font_helvetica_140.c $OUT/font_cambria_140.c
 ```
+
+**Static A8.** LVGL 9.6 blends a glyph straight from the font data only when
+the font is 8 bpp with `static_bitmap = 1`; a 4-bpp font is unpacked into a
+scratch buffer for every glyph on every frame, which made the 140 px titles
+and values a measurable part of each page transition (about 5 ms of a
+46 ms frame, `esphome/README.md`). `tools/font_a8.py` expands every 4-bit
+pixel through the table LVGL itself uses at run time (`opa4_table`, value ×
+17), so the rendered output is unchanged; glyph data doubles in flash. The
+`Opts:` header is left as generated, so it still names `--bpp 4` (the
+converter's input) while the `Bpp:` line and the descriptor say 8 — and the
+blinds-label glyph check keeps reading the `--range`. A converted file is
+recognised and skipped, so the step is safe to repeat.
 
 The `--range` lists of the two 140 px fonts are the glyphs the UI actually
 renders. `font_helvetica_100.c` renders the configurable blinds group labels,

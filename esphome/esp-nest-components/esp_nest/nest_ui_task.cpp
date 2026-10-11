@@ -89,10 +89,15 @@ namespace esphome::esp_nest {
 
 static const char *const TAG = "esp_nest.ui";
 
-/// Two partial-mode draw buffers of 40 lines each, in internal DMA-capable
-/// RAM (native rendered 60 lines into one static buffer; LVGL 9.6 needs
-/// LV_DRAW_BUF_ALIGN-aligned buffers, which a static array does not give).
-static constexpr int32_t DRAW_BUF_LINES = 40;
+/// One partial-mode draw buffer of 80 lines in internal DMA-capable RAM
+/// (LVGL 9.6 needs LV_DRAW_BUF_ALIGN-aligned buffers, which a static array
+/// does not give). Measured on hardware (esphome/README.md): rendering the
+/// screen in fewer, taller areas beats double buffering — 2x40 lines cost
+/// 16 ms more per page-transition frame — because every object crossing an
+/// area boundary is drawn once per area. The flush is a synchronous copy,
+/// so a second buffer would not overlap anything; a flush worker on the
+/// other core was measured too and gained nothing.
+static constexpr int32_t DRAW_BUF_LINES = 80;
 static constexpr uint32_t DRAW_BUF_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
 
 /*
@@ -127,6 +132,63 @@ static void lvgl_log_cb(lv_log_level_t level, const char *buf) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Render statistics (nest_ui only): frames and refresh durations per window,
+// logged at DEBUG while the screen is being redrawn, silent when static.
+// ---------------------------------------------------------------------------
+
+static constexpr int64_t RENDER_STATS_WINDOW_US = 2000 * 1000;
+
+struct RenderStats {
+  int64_t window_start_us{0};
+  int64_t refr_start_us{0};
+  int64_t refr_total_us{0};
+  int64_t refr_max_us{0};
+  uint32_t frames{0};
+};
+static RenderStats s_render{};
+
+static void render_stats_event_cb(lv_event_t *e) {
+  const int64_t now = esp_timer_get_time();
+  if (lv_event_get_code(e) == LV_EVENT_REFR_START) {
+    if (s_render.frames == 0)
+      s_render.window_start_us = now;
+    s_render.refr_start_us = now;
+    return;
+  }
+  const int64_t dt = now - s_render.refr_start_us;
+  s_render.frames++;
+  s_render.refr_total_us += dt;
+  if (dt > s_render.refr_max_us)
+    s_render.refr_max_us = dt;
+}
+
+/// Logs and resets the window once it is full; called from the task loop.
+static void render_stats_report() {
+  if (s_render.frames == 0)
+    return;
+  const int64_t elapsed = esp_timer_get_time() - s_render.window_start_us;
+  if (elapsed < RENDER_STATS_WINDOW_US)
+    return;
+  const int64_t flush_us = panel_take_flush_time_us();
+  ESP_LOGD(TAG,
+           "Render: %u frames in %lld ms (%.1f fps), refresh avg %.1f ms (flush %.1f ms), max %.1f ms, "
+           "internal free %u B",
+           static_cast<unsigned>(s_render.frames), static_cast<long long>(elapsed / 1000),
+           s_render.frames * 1e6f / static_cast<float>(elapsed), s_render.refr_total_us / 1000.0f / s_render.frames,
+           flush_us / 1000.0f / s_render.frames, s_render.refr_max_us / 1000.0f,
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+  s_render = RenderStats{};
+}
+
+#ifdef USE_ESP_NEST_UI_BENCHMARK
+/// Benchmark mode: one menu step every 1.5 s, always inside the menu.
+static void benchmark_timer_cb(lv_timer_t * /*timer*/) {
+  if (!ui_is_detail_mode())
+    ui_encoder_navigate(1);
+}
+#endif
+
 /// LVGL core, display and draw buffers.
 static esp_err_t lvgl_init() {
   lv_init();
@@ -134,20 +196,20 @@ static esp_err_t lvgl_init() {
   lv_tick_set_cb(lvgl_tick_ms);
 
   const size_t buf_bytes = static_cast<size_t>(PANEL_H_RES) * DRAW_BUF_LINES * sizeof(uint16_t);
-  void *buf1 = heap_caps_aligned_alloc(LV_DRAW_BUF_ALIGN, buf_bytes, DRAW_BUF_CAPS);
-  void *buf2 = heap_caps_aligned_alloc(LV_DRAW_BUF_ALIGN, buf_bytes, DRAW_BUF_CAPS);
-  lv_display_t *disp = (buf1 != nullptr && buf2 != nullptr) ? lv_display_create(PANEL_H_RES, PANEL_V_RES) : nullptr;
+  void *buf = heap_caps_aligned_alloc(LV_DRAW_BUF_ALIGN, buf_bytes, DRAW_BUF_CAPS);
+  lv_display_t *disp = buf != nullptr ? lv_display_create(PANEL_H_RES, PANEL_V_RES) : nullptr;
   if (disp == nullptr) {
-    ESP_LOGE(TAG, "Out of memory for the display: 2x %u B draw buffers, largest free internal DMA block %u B",
+    ESP_LOGE(TAG, "Out of memory for the display: %u B draw buffer, largest free internal DMA block %u B",
              static_cast<unsigned>(buf_bytes), static_cast<unsigned>(heap_caps_get_largest_free_block(DRAW_BUF_CAPS)));
-    heap_caps_free(buf1);
-    heap_caps_free(buf2);
+    heap_caps_free(buf);
     lv_deinit();
     return ESP_ERR_NO_MEM;
   }
   lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
   lv_display_set_flush_cb(disp, panel_flush_cb);
-  lv_display_set_buffers(disp, buf1, buf2, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+  lv_display_set_buffers(disp, buf, nullptr, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+  lv_display_add_event_cb(disp, render_stats_event_cb, LV_EVENT_REFR_START, nullptr);
+  lv_display_add_event_cb(disp, render_stats_event_cb, LV_EVENT_REFR_READY, nullptr);
   return ESP_OK;
 }
 
@@ -220,6 +282,10 @@ static esp_err_t task_init() {
   // Render the first frame into the framebuffer now, so the backlight
   // never shows what the panel held before.
   lv_refr_now(lv_display_get_default());
+#ifdef USE_ESP_NEST_UI_BENCHMARK
+  ESP_LOGW(TAG, "Render benchmark mode: the menu pages itself every 1.5 s");
+  lv_timer_create(benchmark_timer_cb, 1500, nullptr);
+#endif
 
   // The boot values the settings entities resolved in EspNest::setup()
   // (native defaults 100 / 20 / 30 unless restored). Started before the
@@ -253,6 +319,7 @@ static void ui_task_main(void * /*arg*/) {
     apply_status();
     ui_process_pending();
     uint32_t next_ms = lv_timer_handler();
+    render_stats_report();
     if (next_ms == LV_NO_TIMER_READY)
       next_ms = LV_DEF_REFR_PERIOD;
     if (next_ms < 1)

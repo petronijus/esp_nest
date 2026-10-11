@@ -1,0 +1,14 @@
+# Render benchmark entry (development only): the dev build with the UI
+# paging through the menu on its own; read the DEBUG "Render:" lines with
+# `esphome logs esphome/esp-nest-bench.yaml`. Flash esp-nest-dev.yaml again
+# afterwards — this build must never stay on the device. Mirrors the dev
+# entry (a package that itself !includes substitutions cannot be nested).
+
+substitutions: !include ../private/esphome/substitutions.yaml
+
+packages:
+  esp_nest: !include esp-nest.yaml
+
+esp_nest:
+  display:
+    benchmark: true

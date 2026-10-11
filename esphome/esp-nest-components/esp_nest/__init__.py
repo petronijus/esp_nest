@@ -38,6 +38,7 @@ AUTO_LOAD = ["number", "switch"]
 
 CONF_DISPLAY = "display"
 CONF_HW_MIRROR_X = "hw_mirror_x"
+CONF_BENCHMARK = "benchmark"
 CONF_ESPHOME = "esphome"
 CONF_BLINDS = "blinds"
 CONF_MQTT_ID = "mqtt_id"
@@ -528,6 +529,11 @@ DISPLAY_SCHEMA = cv.Schema(
         # row order (35 fps on hardware); false: per-pixel 180° copy like
         # the native firmware (33.6 fps).
         cv.Optional(CONF_HW_MIRROR_X, default=True): cv.boolean,
+        # Render benchmark (development only): the UI pages through the menu
+        # every 1.5 s on its own, so the page transition renders continuously
+        # and the DEBUG render statistics measure it without a hand on the
+        # knob. Menu navigation sends nothing over MQTT.
+        cv.Optional(CONF_BENCHMARK, default=False): cv.boolean,
     }
 )
 
@@ -656,6 +662,8 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     cg.add(var.set_hw_mirror_x(config[CONF_DISPLAY][CONF_HW_MIRROR_X]))
+    if config[CONF_DISPLAY][CONF_BENCHMARK]:
+        cg.add_define("USE_ESP_NEST_UI_BENCHMARK")
     blinds = config[CONF_BLINDS]
     cg.add(
         var.set_blinds_labels(
