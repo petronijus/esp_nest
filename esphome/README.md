@@ -137,6 +137,19 @@ is always an immutable release tag, never a branch.
 3. The way back works too: ESPHome's `web_server` OTA accepts any app image,
    e.g. `curl -u <user>:<password> -F firmware=@native.bin http://<ip>/update`.
 
+Scripted, with the checks the manual commands lack (app image only, ≤ 4 MB,
+the right firmware on the target, no placeholder-WiFi rollback image; secrets
+from `esphome/secrets.yaml`, never on a command line):
+
+| Script | Does |
+|---|---|
+| `scripts/migrate-to-esphome.sh <ip> [image]` | Step 1, then waits for ESPHome's web server. |
+| `scripts/mqtt-legacy-cleanup.sh <esp_xxxxxx> [--apply]` | Clears the native firmware's retained discovery configs and `avail`, so HA drops the old MQTT device. Dry run without `--apply`. |
+| `scripts/rollback-to-native.sh <ip> [image]` | Step 3 with the local native build (`esphome/fallback/native-v2.0.1.bin`). |
+
+After the migration and cleanup, adopt the device in HA (ESPHome
+integration, key `esp_nest_api_key`) and add it to the Device Builder.
+
 Safety net: safe mode after 10 failed boots (display and UI are not started
 there), fallback AP + captive portal after 10 minutes without WiFi. There is
 no bootloader rollback with the current bootloader.
